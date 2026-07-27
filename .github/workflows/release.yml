@@ -1,0 +1,100 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  portable:
+    name: ${{ matrix.filename }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: windows
+            goarch: amd64
+            filename: SpaceSheriff-Windows-x64.exe
+            ldflags: "-s -w -H=windowsgui"
+          - goos: windows
+            goarch: arm64
+            filename: SpaceSheriff-Windows-ARM64.exe
+            ldflags: "-s -w -H=windowsgui"
+          - goos: darwin
+            goarch: arm64
+            filename: SpaceSheriff-macOS-Apple-Silicon
+            ldflags: "-s -w"
+          - goos: darwin
+            goarch: amd64
+            filename: SpaceSheriff-macOS-Intel
+            ldflags: "-s -w"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: portable/go.mod
+          cache-dependency-path: portable/go.mod
+      - name: Build
+        working-directory: portable
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p ../release
+          go build -trimpath -ldflags "${{ matrix.ldflags }}" -o "../release/${{ matrix.filename }}" .
+      - name: Package macOS binary
+        if: matrix.goos == 'darwin'
+        run: |
+          chmod +x "release/${{ matrix.filename }}"
+          cd release
+          zip "${{ matrix.filename }}-Portable.zip" "${{ matrix.filename }}"
+          rm "${{ matrix.filename }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.filename }}
+          path: release/*
+          if-no-files-found: error
+
+  macos-app:
+    name: macOS native app
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements-build.txt
+      - run: python -m unittest discover -s tests -v
+      - run: pyinstaller --noconfirm --clean SpaceSheriff.spec
+      - name: Package app
+        run: |
+          mkdir -p release
+          ditto -c -k --sequesterRsrc --keepParent dist/SpaceSheriff.app release/SpaceSheriff-macOS-Apple-Silicon-App.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SpaceSheriff-macOS-Apple-Silicon-App
+          path: release/SpaceSheriff-macOS-Apple-Silicon-App.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: [portable, macos-app]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME" release/*
+          --title "Space Sheriff $GITHUB_REF_NAME"
+          --notes-file "docs/releases/${GITHUB_REF_NAME}.md"

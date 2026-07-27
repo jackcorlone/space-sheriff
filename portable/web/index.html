@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>空间卫士 Space Sheriff</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <div>
+      <div class="eyebrow">SPACE SHERIFF</div>
+      <h1>看清空间，再安全清理。</h1>
+      <p>本地扫描大文件，显示修改时间，并解释每一条删除建议。文件信息不会离开你的电脑。</p>
+    </div>
+    <button id="quit" class="ghost">退出程序</button>
+  </header>
+
+  <main>
+    <section class="card controls">
+      <div class="field wide">
+        <label for="root">扫描位置</label>
+        <div class="path-row">
+          <select id="roots"></select>
+          <input id="root" spellcheck="false" placeholder="输入磁盘或文件夹路径">
+        </div>
+      </div>
+      <div class="field">
+        <label for="minimum">最小文件</label>
+        <select id="minimum">
+          <option value="104857600">100 MB</option>
+          <option value="524288000" selected>500 MB</option>
+          <option value="1073741824">1 GB</option>
+          <option value="5368709120">5 GB</option>
+        </select>
+      </div>
+      <button id="scan" class="primary">开始扫描</button>
+      <button id="cancel" class="ghost" disabled>停止</button>
+    </section>
+
+    <section id="disk" class="disk card hidden">
+      <div>
+        <span class="muted">磁盘容量</span>
+        <strong id="diskTotal">—</strong>
+      </div>
+      <div class="bar"><i id="diskUsed"></i></div>
+      <div>
+        <span class="muted">可用空间</span>
+        <strong id="diskFree">—</strong>
+      </div>
+    </section>
+
+    <section class="card status-card">
+      <div class="pulse" id="pulse"></div>
+      <div>
+        <strong id="status">准备就绪</strong>
+        <div id="detail" class="muted">选择位置和阈值后开始扫描。</div>
+      </div>
+    </section>
+
+    <section class="card results">
+      <div class="results-head">
+        <div>
+          <h2>大文件</h2>
+          <span id="count" class="muted">尚未扫描</span>
+        </div>
+        <div class="legend">
+          <span class="safe">通常可清理</span>
+          <span class="review">需确认</span>
+          <span class="danger">不建议删除</span>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>大小</th><th>修改时间</th><th>建议</th><th>路径与判断依据</th><th></th></tr></thead>
+          <tbody id="rows">
+            <tr class="empty"><td colspan="5">扫描结果会显示在这里</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast"></div>
+  <script src="app.js"></script>
+</body>
+</html>
