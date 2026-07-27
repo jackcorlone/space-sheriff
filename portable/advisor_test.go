@@ -11,6 +11,9 @@ func TestAdviceProtectsSystemFile(t *testing.T) {
 	if got.Level != "danger" {
 		t.Fatalf("got %q, want danger", got.Level)
 	}
+	if got.RuleID != "SYSTEM_CORE" {
+		t.Fatalf("got rule %q, want SYSTEM_CORE", got.RuleID)
+	}
 }
 
 func TestAdviceAllowsOldCache(t *testing.T) {
@@ -19,6 +22,9 @@ func TestAdviceAllowsOldCache(t *testing.T) {
 	if got.Level != "safe" {
 		t.Fatalf("got %q, want safe", got.Level)
 	}
+	if got.RuleID != "CACHE_OLD_7D" {
+		t.Fatalf("got rule %q, want CACHE_OLD_7D", got.RuleID)
+	}
 }
 
 func TestAdviceProtectsPersonalFile(t *testing.T) {
@@ -26,5 +32,13 @@ func TestAdviceProtectsPersonalFile(t *testing.T) {
 	got := advise(`/Users/me/Documents/report.pdf`, 100, now.Add(-400*24*time.Hour), now)
 	if got.Level != "review" {
 		t.Fatalf("got %q, want review", got.Level)
+	}
+}
+
+func TestAdviceRecognizesOldInstallerInDownloads(t *testing.T) {
+	now := time.Now()
+	got := advise(`C:\Users\me\Downloads\setup.msi`, 100, now.Add(-60*24*time.Hour), now)
+	if got.Level != "safe" || got.RuleID != "INSTALLER_OLD_30D" {
+		t.Fatalf("unexpected advice: %+v", got)
 	}
 }

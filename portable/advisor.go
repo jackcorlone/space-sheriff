@@ -1,23 +1,26 @@
 package main
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 	"time"
 )
 
 type Advice struct {
-	Level  string `json:"level"`
-	Label  string `json:"label"`
-	Reason string `json:"reason"`
-	Score  int    `json:"score"`
+	Level    string `json:"level"`
+	Label    string `json:"label"`
+	Reason   string `json:"reason"`
+	Score    int    `json:"score"`
+	RuleID   string `json:"ruleId"`
+	Category string `json:"category"`
 }
 
 var coreSystemParts = words("system32 syswow64 bin sbin usr etc")
 var protectedParts = set("windows", "system32", "syswow64", "program files", "program files (x86)", "programdata", "system", "library", "applications", "bin", "sbin", "usr", "etc", "var")
 var personalParts = words("desktop documents pictures photos movies music downloads 桌面 文档 图片 影片 音乐 下载")
 var cacheParts = set("cache", "caches", "tmp", "temp", "temporary files", "crashdumps", "logs")
-var installerExts = words(".dmg .pkg .iso .msi .exe")
+var installerExts = words(".dmg .pkg .iso .msi")
 var archiveExts = words(".zip .7z .rar .tar .gz .bz2")
 var personalExts = words(".doc .docx .xls .xlsx .ppt .pptx .pdf .pages .numbers .key .jpg .jpeg .png .heic .mov .mp4")
 
@@ -63,10 +66,20 @@ func advise(path string, size int64, modified, now time.Time) Advice {
 	}
 
 	if intersects(parts, coreSystemParts) {
-		return Advice{"danger", "不建议删除", "位于核心系统目录，删除可能导致系统或软件无法运行。", 0}
+		return Advice{"danger", "不建议删除", "位于核心系统目录，删除可能导致系统或软件无法运行。", 0, "SYSTEM_CORE", "系统文件"}
+	}
+	if installerExts[ext] && age >= 30 {
+		return Advice{
+			"safe",
+			"通常可清理",
+			"这是安装镜像或安装包，已 " + dayText(age) + " 未修改；确认软件已安装后可移入回收站。",
+			80,
+			"INSTALLER_OLD_30D",
+			"安装包",
+		}
 	}
 	if intersects(parts, personalParts) || personalExts[ext] {
-		return Advice{"review", "需人工确认", "可能是个人文件。请先预览或备份，再决定是否删除。", 35}
+		return Advice{"review", "需人工确认", "可能是个人文件。请先预览或备份，再决定是否删除。", 35, "PERSONAL_FILE", "个人文件"}
 	}
 	if intersects(parts, cacheParts) {
 		if age >= 7 {
@@ -74,21 +87,29 @@ func advise(path string, size int64, modified, now time.Time) Advice {
 			if age >= 30 {
 				score = 90
 			}
-			return Advice{"safe", "通常可清理", "位于缓存、临时或日志目录，已较长时间未修改，通常可由应用重新生成。", score}
+			return Advice{
+				"safe",
+				"通常可清理",
+				"位于缓存、临时或日志目录，已 " + dayText(age) + " 未修改，通常可由应用重新生成。",
+				score,
+				"CACHE_OLD_7D",
+				"缓存与日志",
+			}
 		}
-		return Advice{"review", "需人工确认", "位于缓存、临时或日志目录，但文件较新，可能仍在使用。", 45}
+		return Advice{"review", "需人工确认", "位于缓存、临时或日志目录，但文件仅 " + dayText(age) + " 未修改，可能仍在使用。", 45, "CACHE_RECENT", "缓存与日志"}
 	}
 	if intersects(parts, protectedParts) {
-		return Advice{"danger", "不建议删除", "位于系统或应用目录，删除可能导致系统或软件无法运行。", 0}
-	}
-	if installerExts[ext] && age >= 30 {
-		return Advice{"safe", "通常可清理", "这是较旧的安装镜像或安装包；确认软件已安装后可移入回收站。", 80}
+		return Advice{"danger", "不建议删除", "位于系统或应用目录，删除可能导致系统或软件无法运行。", 0, "SYSTEM_PROTECTED", "系统文件"}
 	}
 	if archiveExts[ext] && age >= 90 {
-		return Advice{"review", "可考虑清理", "这是较旧的压缩包；请确认内容已有副本或已解压。", 60}
+		return Advice{"review", "可考虑清理", "这是压缩包，已 " + dayText(age) + " 未修改；请确认内容已有副本或已解压。", 60, "ARCHIVE_OLD_90D", "压缩包"}
 	}
 	if size >= 10*1024*1024*1024 && age >= 180 {
-		return Advice{"review", "可考虑清理", "文件超过 10 GB 且长期未修改，但用途未知。", 55}
+		return Advice{"review", "可考虑清理", "文件超过 10 GB 且已 " + dayText(age) + " 未修改，但用途未知。", 55, "LARGE_STALE_180D", "大型文件"}
 	}
-	return Advice{"review", "需人工确认", "未发现明确的安全清理特征，请确认用途后再处理。", 40}
+	return Advice{"review", "需人工确认", "未发现明确的安全清理特征，请确认用途后再处理。", 40, "UNKNOWN", "其他"}
+}
+
+func dayText(days int) string {
+	return fmt.Sprintf("%d 天", days)
 }

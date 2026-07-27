@@ -46,7 +46,8 @@ jobs:
           CGO_ENABLED: "0"
         run: |
           mkdir -p ../release
-          go build -trimpath -ldflags "${{ matrix.ldflags }}" -o "../release/${{ matrix.filename }}" .
+          VERSION="${GITHUB_REF_NAME#v}"
+          go build -trimpath -ldflags "${{ matrix.ldflags }} -X main.version=$VERSION" -o "../release/${{ matrix.filename }}" .
       - name: Package macOS binary
         if: matrix.goos == 'darwin'
         run: |

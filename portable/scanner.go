@@ -5,15 +5,32 @@ import (
 	"context"
 	"io/fs"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 )
 
 type FileRecord struct {
+	Path             string `json:"path"`
+	Size             int64  `json:"size"`
+	ModifiedAt       string `json:"modifiedAt"`
+	ModifiedUnixNano int64  `json:"-"`
+	Advice           Advice `json:"advice"`
+}
+
+type FolderRecord struct {
 	Path       string `json:"path"`
+	Name       string `json:"name"`
 	Size       int64  `json:"size"`
+	FileCount  int64  `json:"fileCount"`
 	ModifiedAt string `json:"modifiedAt"`
-	Advice     Advice `json:"advice"`
+}
+
+type FolderView struct {
+	Current  FolderRecord   `json:"current"`
+	Parent   string         `json:"parent,omitempty"`
+	Children []FolderRecord `json:"children"`
 }
 
 type ScanStatus struct {
@@ -34,6 +51,7 @@ type scanJob struct {
 	started time.Time
 	cancel  context.CancelFunc
 	known   map[string]FileRecord
+	folders map[string]FolderRecord
 }
 
 func (j *scanJob) snapshot() ScanStatus {
@@ -61,10 +79,17 @@ func (h *recordHeap) Pop() any {
 	return item
 }
 
+type folderAggregate struct {
+	size      int64
+	fileCount int64
+	modified  time.Time
+}
+
 func (j *scanJob) run(ctx context.Context, root string, minimum int64, limit int) {
 	found := &recordHeap{}
 	heap.Init(found)
 	now := time.Now()
+	direct := map[string]*folderAggregate{root: {}}
 
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		select {
@@ -88,6 +113,9 @@ func (j *scanJob) run(ctx context.Context, root string, minimum int64, limit int
 			return nil
 		}
 		if entry.IsDir() {
+			if direct[path] == nil {
+				direct[path] = &folderAggregate{}
+			}
 			j.mu.Lock()
 			j.status.CurrentPath = path
 			j.mu.Unlock()
@@ -106,14 +134,28 @@ func (j *scanJob) run(ctx context.Context, root string, minimum int64, limit int
 		j.mu.Lock()
 		j.status.FilesSeen++
 		j.status.BytesSeen += info.Size()
+		filesSeen := j.status.FilesSeen
 		j.mu.Unlock()
+
+		directory := filepath.Dir(path)
+		aggregate := direct[directory]
+		if aggregate == nil {
+			aggregate = &folderAggregate{}
+			direct[directory] = aggregate
+		}
+		aggregate.size += info.Size()
+		aggregate.fileCount++
+		if info.ModTime().After(aggregate.modified) {
+			aggregate.modified = info.ModTime()
+		}
 
 		if info.Size() >= minimum {
 			record := FileRecord{
-				Path:       path,
-				Size:       info.Size(),
-				ModifiedAt: info.ModTime().Format("2006-01-02 15:04"),
-				Advice:     advise(path, info.Size(), info.ModTime(), now),
+				Path:             path,
+				Size:             info.Size(),
+				ModifiedAt:       info.ModTime().Format("2006-01-02 15:04"),
+				ModifiedUnixNano: info.ModTime().UnixNano(),
+				Advice:           advise(path, info.Size(), info.ModTime(), now),
 			}
 			if found.Len() < limit {
 				heap.Push(found, record)
@@ -122,12 +164,56 @@ func (j *scanJob) run(ctx context.Context, root string, minimum int64, limit int
 				heap.Push(found, record)
 			}
 		}
+		if filesSeen%5000 == 0 {
+			j.mu.Lock()
+			j.status.Results = sortedRecords(*found)
+			j.mu.Unlock()
+		}
 		return nil
 	})
 
-	results := make([]FileRecord, found.Len())
-	for i := len(results) - 1; i >= 0; i-- {
-		results[i] = heap.Pop(found).(FileRecord)
+	results := sortedRecords(*found)
+	paths := make([]string, 0, len(direct))
+	for path := range direct {
+		paths = append(paths, path)
+	}
+	sort.Slice(paths, func(i, k int) bool {
+		return pathDepth(paths[i]) > pathDepth(paths[k])
+	})
+	for _, path := range paths {
+		if path == root {
+			continue
+		}
+		parent := filepath.Dir(path)
+		parentAggregate := direct[parent]
+		if parentAggregate == nil {
+			continue
+		}
+		child := direct[path]
+		parentAggregate.size += child.size
+		parentAggregate.fileCount += child.fileCount
+		if child.modified.After(parentAggregate.modified) {
+			parentAggregate.modified = child.modified
+		}
+	}
+
+	folders := make(map[string]FolderRecord, len(direct))
+	for path, aggregate := range direct {
+		modified := ""
+		if !aggregate.modified.IsZero() {
+			modified = aggregate.modified.Format("2006-01-02 15:04")
+		}
+		name := filepath.Base(path)
+		if path == root {
+			name = path
+		}
+		folders[path] = FolderRecord{
+			Path:       path,
+			Name:       name,
+			Size:       aggregate.size,
+			FileCount:  aggregate.fileCount,
+			ModifiedAt: modified,
+		}
 	}
 
 	j.mu.Lock()
@@ -135,6 +221,7 @@ func (j *scanJob) run(ctx context.Context, root string, minimum int64, limit int
 	j.status.ElapsedMS = time.Since(j.started).Milliseconds()
 	j.status.Results = results
 	j.known = make(map[string]FileRecord, len(results))
+	j.folders = folders
 	for _, record := range results {
 		j.known[record.Path] = record
 	}
@@ -147,4 +234,48 @@ func (j *scanJob) run(ctx context.Context, root string, minimum int64, limit int
 	default:
 		j.status.State = "done"
 	}
+}
+
+func sortedRecords(records recordHeap) []FileRecord {
+	result := append([]FileRecord(nil), records...)
+	sort.Slice(result, func(i, k int) bool {
+		if result[i].Size == result[k].Size {
+			return result[i].Path < result[k].Path
+		}
+		return result[i].Size > result[k].Size
+	})
+	return result
+}
+
+func pathDepth(path string) int {
+	cleaned := filepath.Clean(path)
+	return len(strings.FieldsFunc(cleaned, func(r rune) bool {
+		return r == '/' || r == '\\'
+	}))
+}
+
+func (j *scanJob) folderView(path string) (FolderView, bool) {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	current, ok := j.folders[path]
+	if !ok {
+		return FolderView{}, false
+	}
+	children := make([]FolderRecord, 0)
+	for childPath, child := range j.folders {
+		if childPath != path && filepath.Dir(childPath) == path {
+			children = append(children, child)
+		}
+	}
+	sort.Slice(children, func(i, k int) bool {
+		if children[i].Size == children[k].Size {
+			return children[i].Name < children[k].Name
+		}
+		return children[i].Size > children[k].Size
+	})
+	parent := ""
+	if path != j.status.Root {
+		parent = filepath.Dir(path)
+	}
+	return FolderView{Current: current, Parent: parent, Children: children}, true
 }

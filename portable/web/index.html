@@ -9,7 +9,7 @@
 <body>
   <header>
     <div>
-      <div class="eyebrow">SPACE SHERIFF</div>
+      <div class="eyebrow">SPACE SHERIFF <span id="version">v0.2</span></div>
       <h1>看清空间，再安全清理。</h1>
       <p>本地扫描大文件，显示修改时间，并解释每一条删除建议。文件信息不会离开你的电脑。</p>
     </div>
@@ -58,6 +58,22 @@
       </div>
     </section>
 
+    <section id="folderSection" class="card folders hidden">
+      <div class="results-head">
+        <div>
+          <h2>文件夹占用</h2>
+          <span id="folderPath" class="muted">—</span>
+        </div>
+        <button id="folderUp" class="ghost" disabled>返回上一级</button>
+      </div>
+      <div class="table-wrap folder-table">
+        <table>
+          <thead><tr><th>文件夹</th><th>大小</th><th>文件数</th><th>最近修改</th><th>占当前目录</th></tr></thead>
+          <tbody id="folderRows"></tbody>
+        </table>
+      </div>
+    </section>
+
     <section class="card results">
       <div class="results-head">
         <div>
@@ -70,11 +86,36 @@
           <span class="danger">不建议删除</span>
         </div>
       </div>
+      <div class="filters">
+        <input id="search" type="search" placeholder="搜索路径或文件名">
+        <select id="adviceFilter" aria-label="建议筛选">
+          <option value="">全部建议</option>
+          <option value="safe">通常可清理</option>
+          <option value="review">需人工确认</option>
+          <option value="danger">不建议删除</option>
+        </select>
+        <select id="categoryFilter" aria-label="类型筛选">
+          <option value="">全部类型</option>
+        </select>
+        <select id="sort" aria-label="排序">
+          <option value="size-desc">大小：从大到小</option>
+          <option value="size-asc">大小：从小到大</option>
+          <option value="oldest">修改时间：最早优先</option>
+          <option value="newest">修改时间：最新优先</option>
+          <option value="path">路径</option>
+        </select>
+      </div>
+      <div id="selectionBar" class="selection-bar">
+        <label><input id="selectVisible" type="checkbox"> 选择当前可清理结果</label>
+        <span id="selectionSummary" class="muted">尚未选择文件</span>
+        <button id="clearSelection" class="ghost" disabled>清除选择</button>
+        <button id="trashSelected" class="primary" disabled>移入回收站</button>
+      </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>大小</th><th>修改时间</th><th>建议</th><th>路径与判断依据</th><th></th></tr></thead>
+          <thead><tr><th class="check-col"></th><th>大小</th><th>修改时间</th><th>建议</th><th>路径与判断依据</th><th></th></tr></thead>
           <tbody id="rows">
-            <tr class="empty"><td colspan="5">扫描结果会显示在这里</td></tr>
+            <tr class="empty"><td colspan="6">扫描结果会显示在这里</td></tr>
           </tbody>
         </table>
       </div>
