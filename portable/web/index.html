@@ -9,7 +9,7 @@
 <body>
   <header>
     <div>
-      <div class="eyebrow">SPACE SHERIFF <span id="version">v0.2</span></div>
+      <div class="eyebrow">SPACE SHERIFF <span id="version">v0.3</span></div>
       <h1>看清空间，再安全清理。</h1>
       <p>本地扫描大文件，显示修改时间，并解释每一条删除建议。文件信息不会离开你的电脑。</p>
     </div>
@@ -37,6 +37,29 @@
       <button id="scan" class="primary">开始扫描</button>
       <button id="cancel" class="ghost" disabled>停止</button>
     </section>
+
+    <details class="card settings">
+      <summary>扫描排除与重复检测设置</summary>
+      <div class="settings-grid">
+        <div class="field">
+          <label for="duplicateMinimum">重复文件最小体积</label>
+          <select id="duplicateMinimum">
+            <option value="1048576">1 MB</option>
+            <option value="10485760" selected>10 MB</option>
+            <option value="104857600">100 MB</option>
+          </select>
+          <span class="hint">仅对相同大小的候选文件计算完整 SHA-256。</span>
+        </div>
+        <div class="field wide">
+          <label for="excludes">排除规则（每行一条）</label>
+          <textarea id="excludes" rows="5" spellcheck="false">.git
+node_modules
+.venv
+__pycache__</textarea>
+          <span class="hint">可填写目录名、扫描根目录下的相对路径或绝对路径。</span>
+        </div>
+      </div>
+    </details>
 
     <section id="disk" class="disk card hidden">
       <div>
@@ -74,16 +97,51 @@
       </div>
     </section>
 
+    <section id="duplicateSection" class="card duplicates hidden">
+      <div class="results-head">
+        <div>
+          <h2>重复文件</h2>
+          <span id="duplicateSummary" class="muted">尚未检测</span>
+        </div>
+      </div>
+      <div id="duplicateGroups" class="duplicate-groups"></div>
+    </section>
+
+    <section class="card plan">
+      <div class="results-head">
+        <div>
+          <h2>清理计划</h2>
+          <span id="planSummary" class="muted">尚未加入文件</span>
+        </div>
+        <div class="head-actions">
+          <button id="clearPlan" class="ghost" disabled>清空计划</button>
+          <button id="executePlan" class="primary" disabled>确认并移入回收站</button>
+        </div>
+      </div>
+      <div class="table-wrap plan-table">
+        <table>
+          <thead><tr><th>大小</th><th>风险</th><th>文件</th><th></th></tr></thead>
+          <tbody id="planRows">
+            <tr class="empty"><td colspan="4">从大文件或重复文件中加入待清理项目</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
     <section class="card results">
       <div class="results-head">
         <div>
           <h2>大文件</h2>
           <span id="count" class="muted">尚未扫描</span>
         </div>
-        <div class="legend">
-          <span class="safe">通常可清理</span>
-          <span class="review">需确认</span>
-          <span class="danger">不建议删除</span>
+        <div class="head-actions">
+          <div class="legend">
+            <span class="safe">通常可清理</span>
+            <span class="review">需确认</span>
+            <span class="danger">不建议删除</span>
+          </div>
+          <button id="exportJson" class="ghost">导出 JSON</button>
+          <button id="exportCsv" class="ghost">导出 CSV</button>
         </div>
       </div>
       <div class="filters">
@@ -109,7 +167,7 @@
         <label><input id="selectVisible" type="checkbox"> 选择当前可清理结果</label>
         <span id="selectionSummary" class="muted">尚未选择文件</span>
         <button id="clearSelection" class="ghost" disabled>清除选择</button>
-        <button id="trashSelected" class="primary" disabled>移入回收站</button>
+        <button id="trashSelected" class="primary" disabled>加入清理计划</button>
       </div>
       <div class="table-wrap">
         <table>

@@ -20,13 +20,29 @@ jobs:
       run:
         working-directory: portable
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
         with:
           go-version-file: portable/go.mod
           cache-dependency-path: portable/go.mod
       - run: go test ./...
+      - name: Race detection and coverage threshold
+        if: runner.os == 'macOS'
+        run: |
+          go test -race -coverprofile=coverage.out ./...
+          COVERAGE=$(go tool cover -func=coverage.out | awk '/total:/ {gsub("%", "", $3); print $3}')
+          awk -v coverage="$COVERAGE" 'BEGIN { if (coverage < 65) exit 1 }'
       - run: go vet ./...
+
+  web:
+    name: Embedded web UI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+      - run: node --check portable/web/app.js
 
   python:
     name: Python · ${{ matrix.os }}
@@ -36,8 +52,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - run: python -m unittest discover -s tests -v

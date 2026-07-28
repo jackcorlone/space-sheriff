@@ -23,7 +23,7 @@ import (
 //go:embed web/*
 var webFiles embed.FS
 
-var version = "0.2.0-dev"
+var version = "0.3.0-dev"
 
 type server struct {
 	mu    sync.Mutex
@@ -134,9 +134,11 @@ func (s *server) startScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var request struct {
-		Path    string `json:"path"`
-		Minimum int64  `json:"minimum"`
-		Limit   int    `json:"limit"`
+		Path             string   `json:"path"`
+		Minimum          int64    `json:"minimum"`
+		DuplicateMinimum int64    `json:"duplicateMinimum"`
+		Limit            int      `json:"limit"`
+		Excludes         []string `json:"excludes"`
 	}
 	if !decodeJSON(w, r, &request) {
 		return
@@ -157,6 +159,13 @@ func (s *server) startScan(w http.ResponseWriter, r *http.Request) {
 	if request.Limit < 1 || request.Limit > 5000 {
 		request.Limit = 2000
 	}
+	if request.DuplicateMinimum < 1024*1024 {
+		request.DuplicateMinimum = 1024 * 1024
+	}
+	if len(request.Excludes) > 100 {
+		http.Error(w, "排除规则最多 100 条", http.StatusBadRequest)
+		return
+	}
 
 	s.mu.Lock()
 	if s.job != nil && s.job.snapshot().State == "running" {
@@ -166,15 +175,21 @@ func (s *server) startScan(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	job := &scanJob{
-		status:  ScanStatus{State: "running", Root: root},
-		started: time.Now(),
-		cancel:  cancel,
-		known:   make(map[string]FileRecord),
-		folders: make(map[string]FolderRecord),
+		status:          ScanStatus{State: "running", Phase: "scanning", Root: root},
+		started:         time.Now(),
+		cancel:          cancel,
+		known:           make(map[string]FileRecord),
+		folders:         make(map[string]FolderRecord),
+		duplicateByPath: make(map[string]string),
 	}
 	s.job = job
 	s.mu.Unlock()
-	go job.run(ctx, root, request.Minimum, request.Limit)
+	go job.run(ctx, root, ScanOptions{
+		Minimum:          request.Minimum,
+		DuplicateMinimum: request.DuplicateMinimum,
+		Limit:            request.Limit,
+		Excludes:         request.Excludes,
+	})
 	writeJSON(w, map[string]bool{"started": true})
 }
 
@@ -266,6 +281,13 @@ func (s *server) trashBatch(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(request.Paths) < 1 || len(request.Paths) > 500 {
 		http.Error(w, "每次请选择 1 到 500 个文件", http.StatusBadRequest)
+		return
+	}
+	s.mu.Lock()
+	job := s.job
+	s.mu.Unlock()
+	if job != nil && job.wouldRemoveEveryDuplicate(request.Paths) {
+		http.Error(w, "清理计划必须为每组重复文件至少保留一个副本", http.StatusBadRequest)
 		return
 	}
 	seen := make(map[string]bool)
@@ -367,6 +389,53 @@ func (j *scanJob) removeRecordLocked(record FileRecord) {
 		}
 		directory = parent
 	}
+	groupID := j.duplicateByPath[record.Path]
+	delete(j.duplicateByPath, record.Path)
+	if groupID == "" {
+		return
+	}
+	for index := range j.status.DuplicateGroups {
+		group := &j.status.DuplicateGroups[index]
+		if group.ID != groupID {
+			continue
+		}
+		for fileIndex := range group.Files {
+			if group.Files[fileIndex].Path == record.Path {
+				group.Files = append(group.Files[:fileIndex], group.Files[fileIndex+1:]...)
+				break
+			}
+		}
+		if len(group.Files) < 2 {
+			if len(group.Files) == 1 {
+				delete(j.duplicateByPath, group.Files[0].Path)
+			}
+			j.status.DuplicateGroups = append(j.status.DuplicateGroups[:index], j.status.DuplicateGroups[index+1:]...)
+		} else {
+			group.Reclaimable = group.Size * int64(len(group.Files)-1)
+		}
+		break
+	}
+}
+
+func (j *scanJob) wouldRemoveEveryDuplicate(paths []string) bool {
+	j.mu.RLock()
+	defer j.mu.RUnlock()
+	selected := make(map[string]bool, len(paths))
+	for _, path := range paths {
+		selected[path] = true
+	}
+	for _, group := range j.status.DuplicateGroups {
+		remaining := 0
+		for _, record := range group.Files {
+			if !selected[record.Path] {
+				remaining++
+			}
+		}
+		if remaining == 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *server) quit(w http.ResponseWriter, r *http.Request) {

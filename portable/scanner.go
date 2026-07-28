@@ -33,25 +33,37 @@ type FolderView struct {
 	Children []FolderRecord `json:"children"`
 }
 
+type DuplicateGroup struct {
+	ID          string       `json:"id"`
+	Size        int64        `json:"size"`
+	Reclaimable int64        `json:"reclaimable"`
+	Files       []FileRecord `json:"files"`
+}
+
 type ScanStatus struct {
-	State       string       `json:"state"`
-	Root        string       `json:"root"`
-	FilesSeen   int64        `json:"filesSeen"`
-	BytesSeen   int64        `json:"bytesSeen"`
-	Errors      int64        `json:"errors"`
-	CurrentPath string       `json:"currentPath"`
-	ElapsedMS   int64        `json:"elapsedMs"`
-	Results     []FileRecord `json:"results,omitempty"`
-	Message     string       `json:"message,omitempty"`
+	State           string           `json:"state"`
+	Phase           string           `json:"phase"`
+	Root            string           `json:"root"`
+	FilesSeen       int64            `json:"filesSeen"`
+	FilesHashed     int64            `json:"filesHashed"`
+	BytesSeen       int64            `json:"bytesSeen"`
+	Errors          int64            `json:"errors"`
+	Excluded        int64            `json:"excluded"`
+	CurrentPath     string           `json:"currentPath"`
+	ElapsedMS       int64            `json:"elapsedMs"`
+	Results         []FileRecord     `json:"results,omitempty"`
+	DuplicateGroups []DuplicateGroup `json:"duplicateGroups,omitempty"`
+	Message         string           `json:"message,omitempty"`
 }
 
 type scanJob struct {
-	mu      sync.RWMutex
-	status  ScanStatus
-	started time.Time
-	cancel  context.CancelFunc
-	known   map[string]FileRecord
-	folders map[string]FolderRecord
+	mu              sync.RWMutex
+	status          ScanStatus
+	started         time.Time
+	cancel          context.CancelFunc
+	known           map[string]FileRecord
+	folders         map[string]FolderRecord
+	duplicateByPath map[string]string
 }
 
 func (j *scanJob) snapshot() ScanStatus {
@@ -59,6 +71,7 @@ func (j *scanJob) snapshot() ScanStatus {
 	defer j.mu.RUnlock()
 	out := j.status
 	out.Results = append([]FileRecord(nil), j.status.Results...)
+	out.DuplicateGroups = cloneDuplicateGroups(j.status.DuplicateGroups)
 	if j.status.State == "running" {
 		out.ElapsedMS = time.Since(j.started).Milliseconds()
 	}
@@ -85,11 +98,20 @@ type folderAggregate struct {
 	modified  time.Time
 }
 
-func (j *scanJob) run(ctx context.Context, root string, minimum int64, limit int) {
+type ScanOptions struct {
+	Minimum          int64
+	DuplicateMinimum int64
+	Limit            int
+	Excludes         []string
+}
+
+func (j *scanJob) run(ctx context.Context, root string, options ScanOptions) {
 	found := &recordHeap{}
 	heap.Init(found)
 	now := time.Now()
 	direct := map[string]*folderAggregate{root: {}}
+	duplicateCandidates := make([]FileRecord, 0)
+	excludes := newExcludeMatcher(root, options.Excludes)
 
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		select {
@@ -107,6 +129,15 @@ func (j *scanJob) run(ctx context.Context, root string, minimum int64, limit int
 			return nil
 		}
 		if entry.Type()&fs.ModeSymlink != 0 {
+			if entry.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		if path != root && excludes.match(path) {
+			j.mu.Lock()
+			j.status.Excluded++
+			j.mu.Unlock()
 			if entry.IsDir() {
 				return fs.SkipDir
 			}
@@ -149,7 +180,7 @@ func (j *scanJob) run(ctx context.Context, root string, minimum int64, limit int
 			aggregate.modified = info.ModTime()
 		}
 
-		if info.Size() >= minimum {
+		if info.Size() >= options.Minimum || info.Size() >= options.DuplicateMinimum {
 			record := FileRecord{
 				Path:             path,
 				Size:             info.Size(),
@@ -157,11 +188,16 @@ func (j *scanJob) run(ctx context.Context, root string, minimum int64, limit int
 				ModifiedUnixNano: info.ModTime().UnixNano(),
 				Advice:           advise(path, info.Size(), info.ModTime(), now),
 			}
-			if found.Len() < limit {
-				heap.Push(found, record)
-			} else if (*found)[0].Size < record.Size {
-				heap.Pop(found)
-				heap.Push(found, record)
+			if info.Size() >= options.DuplicateMinimum {
+				duplicateCandidates = append(duplicateCandidates, record)
+			}
+			if info.Size() >= options.Minimum {
+				if found.Len() < options.Limit {
+					heap.Push(found, record)
+				} else if (*found)[0].Size < record.Size {
+					heap.Pop(found)
+					heap.Push(found, record)
+				}
 			}
 		}
 		if filesSeen%5000 == 0 {
@@ -173,6 +209,15 @@ func (j *scanJob) run(ctx context.Context, root string, minimum int64, limit int
 	})
 
 	results := sortedRecords(*found)
+	var duplicateGroups []DuplicateGroup
+	var duplicateByPath map[string]string
+	if err == nil {
+		j.mu.Lock()
+		j.status.Phase = "duplicates"
+		j.status.CurrentPath = ""
+		j.mu.Unlock()
+		duplicateGroups, duplicateByPath, err = j.findDuplicates(ctx, duplicateCandidates)
+	}
 	paths := make([]string, 0, len(direct))
 	for path := range direct {
 		paths = append(paths, path)
@@ -220,10 +265,17 @@ func (j *scanJob) run(ctx context.Context, root string, minimum int64, limit int
 	defer j.mu.Unlock()
 	j.status.ElapsedMS = time.Since(j.started).Milliseconds()
 	j.status.Results = results
+	j.status.DuplicateGroups = duplicateGroups
 	j.known = make(map[string]FileRecord, len(results))
 	j.folders = folders
+	j.duplicateByPath = duplicateByPath
 	for _, record := range results {
 		j.known[record.Path] = record
+	}
+	for _, group := range duplicateGroups {
+		for _, record := range group.Files {
+			j.known[record.Path] = record
+		}
 	}
 	switch {
 	case err == context.Canceled:
@@ -233,7 +285,16 @@ func (j *scanJob) run(ctx context.Context, root string, minimum int64, limit int
 		j.status.Message = err.Error()
 	default:
 		j.status.State = "done"
+		j.status.Phase = "done"
 	}
+}
+
+func cloneDuplicateGroups(groups []DuplicateGroup) []DuplicateGroup {
+	cloned := append([]DuplicateGroup(nil), groups...)
+	for index := range cloned {
+		cloned[index].Files = append([]FileRecord(nil), cloned[index].Files...)
+	}
+	return cloned
 }
 
 func sortedRecords(records recordHeap) []FileRecord {

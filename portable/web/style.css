@@ -49,7 +49,16 @@ input, select, button {
   color: var(--ink);
   font: inherit;
 }
-input, select { padding: 0 12px; }
+input, select, textarea { padding: 0 12px; }
+textarea {
+  width: 100%;
+  border: 1px solid #cfd8dc;
+  border-radius: 9px;
+  background: white;
+  color: var(--ink);
+  font: 13px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
+  resize: vertical;
+}
 .path-row { display: grid; grid-template-columns: minmax(160px, .6fr) 1.4fr; gap: 8px; }
 button { padding: 0 18px; font-weight: 700; cursor: pointer; }
 button:disabled { cursor: default; opacity: .45; }
@@ -57,6 +66,10 @@ button:disabled { cursor: default; opacity: .45; }
 .primary:hover { background: var(--green-dark); }
 .ghost { background: transparent; color: inherit; }
 header .ghost { border-color: rgba(255,255,255,.45); color: white; }
+.settings { margin-top: 14px; padding: 0 20px; }
+.settings summary { padding: 16px 0; color: var(--green-dark); font-weight: 800; cursor: pointer; }
+.settings-grid { display: grid; grid-template-columns: minmax(190px, .35fr) 1fr; gap: 20px; padding: 2px 0 20px; }
+.hint { color: var(--muted); font-size: 12px; }
 .disk { display: grid; grid-template-columns: auto 1fr auto; gap: 18px; align-items: center; margin-top: 14px; padding: 16px 20px; }
 .disk div:not(.bar) { display: grid; }
 .bar { height: 10px; overflow: hidden; border-radius: 99px; background: #e4ebe8; }
@@ -69,7 +82,10 @@ header .ghost { border-color: rgba(255,255,255,.45); color: white; }
 .muted { color: var(--muted); }
 .results { margin-top: 14px; overflow: hidden; }
 .folders { margin-top: 14px; overflow: hidden; }
+.duplicates, .plan { margin-top: 14px; overflow: hidden; }
 .results-head { display: flex; justify-content: space-between; align-items: center; gap: 20px; padding: 20px; border-bottom: 1px solid var(--line); }
+.head-actions { display: flex; align-items: center; gap: 9px; }
+.head-actions button { min-height: 36px; padding: 0 12px; font-size: 12px; }
 h2 { margin: 0; font-size: 21px; }
 .legend { display: flex; gap: 16px; font-size: 12px; font-weight: 700; }
 .legend span::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 6px; border-radius: 50%; background: currentColor; }
@@ -106,6 +122,16 @@ th, td { padding: 13px 16px; border-bottom: 1px solid #edf1ef; vertical-align: t
 .selection-bar label { display: flex; align-items: center; gap: 7px; margin-right: auto; color: var(--ink); font-size: 13px; }
 .selection-bar label input { width: 16px; min-height: 16px; accent-color: var(--green); }
 .selection-bar button { min-height: 36px; }
+.duplicate-groups { display: grid; gap: 12px; padding: 16px 20px 20px; }
+.duplicate-card { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+.duplicate-card-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 12px 14px; background: #f7faf8; }
+.duplicate-card-head strong { display: block; }
+.duplicate-files { display: grid; }
+.duplicate-file { display: grid; grid-template-columns: auto 100px 1fr auto; align-items: center; gap: 12px; padding: 10px 14px; border-top: 1px solid #edf1ef; }
+.duplicate-file.keep { background: #f3f8f6; }
+.keep-label { color: var(--safe); font-size: 12px; font-weight: 800; }
+.plan-table { min-height: 0; max-height: 320px; }
+.plan-table th:first-child, .plan-table td:first-child { text-align: right; white-space: nowrap; }
 .empty td { height: 220px; color: var(--muted); text-align: center !important; vertical-align: middle; }
 #toast { position: fixed; right: 24px; bottom: 24px; max-width: 420px; padding: 12px 16px; border-radius: 10px; background: #172026; color: white; opacity: 0; transform: translateY(10px); pointer-events: none; transition: .2s; }
 #toast.show { opacity: 1; transform: none; }
@@ -116,5 +142,9 @@ th, td { padding: 13px 16px; border-bottom: 1px solid #edf1ef; vertical-align: t
   .path-row { grid-template-columns: 1fr; }
   .legend { display: none; }
   .filters { grid-template-columns: 1fr 1fr; }
+  .settings-grid { grid-template-columns: 1fr; }
+  .head-actions { flex-wrap: wrap; justify-content: flex-end; }
   .selection-bar { flex-wrap: wrap; }
+  .duplicate-file { grid-template-columns: 1fr auto; }
+  .duplicate-file .path { grid-column: 1 / -1; }
 }

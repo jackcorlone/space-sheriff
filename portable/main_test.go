@@ -7,7 +7,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestSecureRequiresSessionTokenForAPI(t *testing.T) {
@@ -51,6 +53,21 @@ func TestNewSessionTokenAllowsDeterministicLocalTesting(t *testing.T) {
 	}
 	if token != "test-token" {
 		t.Fatalf("got %q, want test-token", token)
+	}
+}
+
+func TestNewSessionTokenIsRandomByDefault(t *testing.T) {
+	t.Setenv("SPACE_SHERIFF_SESSION_TOKEN", "")
+	first, err := newSessionToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := newSessionToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 64 || first == second {
+		t.Fatalf("unexpected tokens %q and %q", first, second)
 	}
 }
 
@@ -132,5 +149,135 @@ func TestTrashBatchReportsEachUniqueFailure(t *testing.T) {
 		if item.Error == "" {
 			t.Fatalf("missing error for %+v", item)
 		}
+	}
+}
+
+func TestTrashBatchKeepsOneDuplicateCopy(t *testing.T) {
+	app := &server{job: &scanJob{
+		status: ScanStatus{
+			State: "done",
+			DuplicateGroups: []DuplicateGroup{{
+				ID:    "group",
+				Files: []FileRecord{{Path: "one"}, {Path: "two"}},
+			}},
+		},
+	}}
+	body := bytes.NewBufferString(`{"paths":["one","two"]}`)
+	result := httptest.NewRecorder()
+	app.trashBatch(result, httptest.NewRequest(http.MethodPost, "/api/trash-batch", body))
+	if result.Code != http.StatusBadRequest {
+		t.Fatalf("got %d, want 400", result.Code)
+	}
+}
+
+func TestVersionStatusAndCancelHandlers(t *testing.T) {
+	app := &server{}
+
+	versionResult := httptest.NewRecorder()
+	app.version(versionResult, httptest.NewRequest(http.MethodGet, "/api/version", nil))
+	if versionResult.Code != http.StatusOK || !strings.Contains(versionResult.Body.String(), "0.3.0-dev") {
+		t.Fatalf("unexpected version response: %d %s", versionResult.Code, versionResult.Body.String())
+	}
+
+	statusResult := httptest.NewRecorder()
+	app.status(statusResult, httptest.NewRequest(http.MethodGet, "/api/status", nil))
+	if statusResult.Code != http.StatusOK || !strings.Contains(statusResult.Body.String(), `"state":"idle"`) {
+		t.Fatalf("unexpected status response: %d %s", statusResult.Code, statusResult.Body.String())
+	}
+
+	cancelled := false
+	app.job = &scanJob{cancel: func() { cancelled = true }}
+	cancelResult := httptest.NewRecorder()
+	app.cancel(cancelResult, httptest.NewRequest(http.MethodPost, "/api/cancel", nil))
+	if cancelResult.Code != http.StatusOK || !cancelled {
+		t.Fatalf("cancel response: %d, cancelled=%v", cancelResult.Code, cancelled)
+	}
+}
+
+func TestStartScanValidatesAndCompletes(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "file.bin"), []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app := &server{}
+	body := bytes.NewBufferString(`{"path":` + strconvQuote(root) + `,"minimum":0,"duplicateMinimum":1,"limit":20,"excludes":[".git"]}`)
+	result := httptest.NewRecorder()
+	app.startScan(result, httptest.NewRequest(http.MethodPost, "/api/scan", body))
+	if result.Code != http.StatusOK {
+		t.Fatalf("start scan got %d: %s", result.Code, result.Body.String())
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for app.job.snapshot().State == "running" && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	status := app.job.snapshot()
+	if status.State != "done" || status.FilesSeen != 1 {
+		t.Fatalf("unexpected completed scan: %+v", status)
+	}
+
+	invalidResult := httptest.NewRecorder()
+	invalidBody := bytes.NewBufferString(`{"path":"/path/that/does/not/exist"}`)
+	app.startScan(invalidResult, httptest.NewRequest(http.MethodPost, "/api/scan", invalidBody))
+	if invalidResult.Code != http.StatusBadRequest {
+		t.Fatalf("invalid path got %d, want 400", invalidResult.Code)
+	}
+}
+
+func strconvQuote(value string) string {
+	encoded, _ := json.Marshal(value)
+	return string(encoded)
+}
+
+func TestTrashOneRejectsUnsafeStates(t *testing.T) {
+	app := &server{}
+	if _, err := app.trashOne("missing"); err == nil {
+		t.Fatal("trash without scan was allowed")
+	}
+
+	app.job = &scanJob{
+		status: ScanStatus{State: "running"},
+		known:  map[string]FileRecord{"file": {Path: "file"}},
+	}
+	if _, err := app.trashOne("file"); err == nil {
+		t.Fatal("trash during scan was allowed")
+	}
+
+	app.job.status.State = "done"
+	app.job.known["system"] = FileRecord{Path: "system", Advice: Advice{Level: "danger"}}
+	if _, err := app.trashOne("unknown"); err == nil {
+		t.Fatal("unknown file was allowed")
+	}
+	if _, err := app.trashOne("system"); err == nil {
+		t.Fatal("protected file was allowed")
+	}
+}
+
+func TestRemoveRecordUpdatesFoldersAndDuplicateGroups(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "one.bin")
+	other := filepath.Join(root, "two.bin")
+	record := FileRecord{Path: path, Size: 10}
+	job := &scanJob{
+		status: ScanStatus{
+			Root:    root,
+			Results: []FileRecord{record},
+			DuplicateGroups: []DuplicateGroup{{
+				ID: "group", Size: 10, Reclaimable: 10,
+				Files: []FileRecord{record, {Path: other, Size: 10}},
+			}},
+		},
+		known:           map[string]FileRecord{path: record, other: {Path: other, Size: 10}},
+		folders:         map[string]FolderRecord{root: {Path: root, Size: 20, FileCount: 2}},
+		duplicateByPath: map[string]string{path: "group", other: "group"},
+	}
+	job.removeRecordLocked(record)
+	if len(job.status.Results) != 0 || len(job.status.DuplicateGroups) != 0 {
+		t.Fatalf("record remained: %+v", job.status)
+	}
+	if job.folders[root].Size != 10 || job.folders[root].FileCount != 1 {
+		t.Fatalf("folder not updated: %+v", job.folders[root])
+	}
+	if job.duplicateByPath[other] != "" {
+		t.Fatal("remaining single file still marked duplicate")
 	}
 }
