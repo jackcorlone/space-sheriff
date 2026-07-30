@@ -13,6 +13,8 @@ let allRecords = [];
 let selected = new Set();
 let duplicateGroups = [];
 let plan = new Set();
+let persistedPlanRecords = new Map();
+let planSave = Promise.resolve();
 let currentFolder = "";
 let scanRoot = "";
 
@@ -78,7 +80,6 @@ async function startScan() {
   try {
     scanRoot = $("root").value;
     selected.clear();
-    plan.clear();
     allRecords = [];
     duplicateGroups = [];
     currentFolder = "";
@@ -115,7 +116,7 @@ async function updateStatus() {
     }
     if (status.state === "running") {
       $("detail").textContent = status.phase === "duplicates"
-        ? `正在核对重复内容 · 已计算 ${status.filesHashed.toLocaleString()} 个文件哈希 · ${status.currentPath || ""}`
+        ? `正在核对重复内容 · 新计算 ${status.filesHashed.toLocaleString()} 个哈希 · 复用 ${(status.hashesReused || 0).toLocaleString()} 个 · ${status.currentPath || ""}`
         : `已检查 ${status.filesSeen.toLocaleString()} 个文件（${humanSize(status.bytesSeen)}） · ${status.currentPath || ""}`;
       return;
     }
@@ -123,7 +124,7 @@ async function updateStatus() {
     setRunning(false);
     if (["done", "cancelled"].includes(status.state)) {
       $("status").textContent = status.state === "done" ? "扫描完成" : "扫描已停止";
-      $("detail").textContent = `检查 ${status.filesSeen.toLocaleString()} 个文件 · 排除 ${status.excluded.toLocaleString()} 项 · 核对 ${status.filesHashed.toLocaleString()} 个候选 · ${status.errors.toLocaleString()} 个错误 · ${(status.elapsedMs / 1000).toFixed(1)} 秒`;
+      $("detail").textContent = `检查 ${status.filesSeen.toLocaleString()} 个文件 · 排除 ${status.excluded.toLocaleString()} 项 · 新计算 ${status.filesHashed.toLocaleString()} 个哈希 · 复用 ${(status.hashesReused || 0).toLocaleString()} 个 · ${status.errors.toLocaleString()} 个错误 · ${(status.elapsedMs / 1000).toFixed(1)} 秒`;
       allRecords = status.results || [];
       duplicateGroups = status.duplicateGroups || [];
       updateCategories();
@@ -182,7 +183,33 @@ function recordByPath(path) {
     const duplicate = group.files.find((item) => item.path === path);
     if (duplicate) return duplicate;
   }
-  return null;
+  return persistedPlanRecords.get(path) || null;
+}
+
+async function loadPlan() {
+  const records = await api("/api/plan");
+  persistedPlanRecords = new Map(records.map((record) => [record.path, record]));
+  plan = new Set(records.map((record) => record.path));
+  renderPlan();
+}
+
+function persistPlan() {
+  const paths = [...plan];
+  planSave = planSave.then(async () => {
+    try {
+      const records = await api("/api/plan", {
+        method: "POST",
+        body: JSON.stringify({paths})
+      });
+      persistedPlanRecords = new Map(records.map((record) => [record.path, record]));
+    } catch (error) {
+      toast(error.message);
+      await loadPlan();
+      renderFiles();
+      renderDuplicates();
+    }
+  });
+  return planSave;
 }
 
 function duplicateGroupFor(path) {
@@ -337,8 +364,10 @@ async function executeCleanupPlan() {
     });
     const succeeded = new Set(response.results.filter((item) => !item.error).map((item) => item.path));
     const failed = response.results.filter((item) => item.error);
+    const auditFailures = response.results.filter((item) => item.auditError);
     succeeded.forEach((path) => selected.delete(path));
     succeeded.forEach((path) => plan.delete(path));
+    succeeded.forEach((path) => persistedPlanRecords.delete(path));
     const latest = await api("/api/status");
     allRecords = latest.results || [];
     duplicateGroups = latest.duplicateGroups || [];
@@ -349,8 +378,15 @@ async function executeCleanupPlan() {
     if (currentFolder) await loadFolder(currentFolder);
     await refreshDisk();
     toast(`已移入回收站 ${succeeded.size} 个文件，实际释放 ${humanSize(response.released)}`);
+    if (response.transactionId) {
+      console.info(`Space Sheriff cleanup transaction: ${response.transactionId}`);
+    }
     if (failed.length) {
       alert(`以下 ${failed.length} 个文件未清理：\n\n` + failed.slice(0, 10).map((item) => `${item.path}\n${item.error}`).join("\n\n"));
+    }
+    if (auditFailures.length) {
+      alert("文件操作已完成，但本地审计记录不完整：\n\n" +
+        auditFailures.map((item) => item.auditError).join("\n"));
     }
   } catch (error) {
     toast(error.message);
@@ -366,6 +402,7 @@ function addSelectedToPlan() {
   renderFiles();
   renderDuplicates();
   renderPlan();
+  persistPlan();
   toast(`已将 ${added} 个文件加入清理计划`);
 }
 
@@ -384,6 +421,7 @@ $("rows").addEventListener("click", (event) => {
     renderFiles();
     renderDuplicates();
     renderPlan();
+    persistPlan();
   }
 });
 
@@ -400,6 +438,7 @@ $("duplicateGroups").addEventListener("click", (event) => {
       renderFiles();
       renderDuplicates();
       renderPlan();
+      persistPlan();
     }
     return;
   }
@@ -415,6 +454,7 @@ $("duplicateGroups").addEventListener("click", (event) => {
   renderFiles();
   renderDuplicates();
   renderPlan();
+  persistPlan();
   toast(`已加入 ${added} 个重复副本，并保留最新文件`);
 });
 
@@ -425,6 +465,7 @@ $("planRows").addEventListener("click", (event) => {
   renderFiles();
   renderDuplicates();
   renderPlan();
+  persistPlan();
 });
 
 $("folderUp").addEventListener("click", () => {
@@ -453,6 +494,7 @@ $("clearPlan").addEventListener("click", () => {
   renderFiles();
   renderDuplicates();
   renderPlan();
+  persistPlan();
 });
 $("executePlan").addEventListener("click", executeCleanupPlan);
 
@@ -517,6 +559,6 @@ $("quit").addEventListener("click", async () => {
   document.body.innerHTML = `<main><section class="card status-card"><strong>空间卫士已退出，可以关闭此页面。</strong></section></main>`;
 });
 
-Promise.all([loadRoots(), api("/api/version")])
+Promise.all([loadRoots(), api("/api/version"), loadPlan()])
   .then(([, info]) => { $("version").textContent = `v${info.version}`; })
   .catch((error) => toast(error.message));

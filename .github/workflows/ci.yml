@@ -24,7 +24,9 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: portable/go.mod
-          cache-dependency-path: portable/go.mod
+          cache-dependency-path: |
+            portable/go.mod
+            portable/go.sum
       - run: go test ./...
       - name: Race detection and coverage threshold
         if: runner.os == 'macOS'
@@ -33,6 +35,32 @@ jobs:
           COVERAGE=$(go tool cover -func=coverage.out | awk '/total:/ {gsub("%", "", $3); print $3}')
           awk -v coverage="$COVERAGE" 'BEGIN { if (coverage < 65) exit 1 }'
       - run: go vet ./...
+
+  portable-build:
+    name: Portable · ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [darwin, windows]
+        goarch: [amd64, arm64]
+    defaults:
+      run:
+        working-directory: portable
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: portable/go.mod
+          cache-dependency-path: |
+            portable/go.mod
+            portable/go.sum
+      - name: Build without CGO
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: go build -trimpath -o "${{ runner.temp }}/space-sheriff" .
 
   web:
     name: Embedded web UI

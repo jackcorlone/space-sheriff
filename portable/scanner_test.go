@@ -156,3 +156,62 @@ func TestHashFileCanBeCancelled(t *testing.T) {
 		t.Fatalf("got %v, want context canceled", err)
 	}
 }
+
+func TestScannerDoesNotReportHardLinksAsDuplicates(t *testing.T) {
+	root := t.TempDir()
+	original := filepath.Join(root, "original.bin")
+	link := filepath.Join(root, "link.bin")
+	if err := os.WriteFile(original, []byte("same-physical-file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(original, link); err != nil {
+		t.Skipf("hard links are unavailable: %v", err)
+	}
+	job := &scanJob{
+		status:          ScanStatus{State: "running", Root: root},
+		started:         time.Now(),
+		known:           make(map[string]FileRecord),
+		folders:         make(map[string]FolderRecord),
+		duplicateByPath: make(map[string]string),
+	}
+	job.run(context.Background(), root, ScanOptions{Minimum: 0, DuplicateMinimum: 1, Limit: 20})
+	status := job.snapshot()
+	if len(status.DuplicateGroups) != 0 {
+		t.Fatalf("hard links were reported as duplicates: %+v", status.DuplicateGroups)
+	}
+}
+
+func TestScannerReusesHashesOnSecondScan(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"one.bin", "two.bin"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte("same-content"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store, _ := testStore(t)
+	run := func() ScanStatus {
+		sessionID, err := store.beginScan(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		job := &scanJob{
+			status:          ScanStatus{State: "running", Root: root},
+			started:         time.Now(),
+			known:           make(map[string]FileRecord),
+			folders:         make(map[string]FolderRecord),
+			duplicateByPath: make(map[string]string),
+			store:           store,
+			sessionID:       sessionID,
+		}
+		job.run(context.Background(), root, ScanOptions{Minimum: 0, DuplicateMinimum: 1, Limit: 20})
+		return job.snapshot()
+	}
+	first := run()
+	second := run()
+	if first.FilesHashed != 2 || first.HashesReused != 0 {
+		t.Fatalf("unexpected first scan cache stats: %+v", first)
+	}
+	if second.FilesHashed != 0 || second.HashesReused != 2 {
+		t.Fatalf("unexpected second scan cache stats: %+v", second)
+	}
+}

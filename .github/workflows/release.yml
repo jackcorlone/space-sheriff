@@ -37,7 +37,9 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: portable/go.mod
-          cache-dependency-path: portable/go.mod
+          cache-dependency-path: |
+            portable/go.mod
+            portable/go.sum
       - name: Build
         working-directory: portable
         env:

@@ -170,12 +170,61 @@ func TestTrashBatchKeepsOneDuplicateCopy(t *testing.T) {
 	}
 }
 
+func TestPlanHandlerPersistsKnownRecords(t *testing.T) {
+	store, _ := testStore(t)
+	path := filepath.Join(t.TempDir(), "candidate.bin")
+	record := FileRecord{
+		Path:             path,
+		Identity:         "identity",
+		Size:             10,
+		ModifiedUnixNano: 20,
+		Advice:           Advice{Level: "review", Label: "需人工确认", RuleID: "TEST"},
+	}
+	app := &server{
+		store: store,
+		job: &scanJob{
+			status: ScanStatus{State: "done"},
+			known:  map[string]FileRecord{path: record},
+		},
+	}
+	body := bytes.NewBufferString(`{"paths":[` + strconvQuote(path) + `]}`)
+	result := httptest.NewRecorder()
+	app.plan(result, httptest.NewRequest(http.MethodPost, "/api/plan", body))
+	if result.Code != http.StatusOK {
+		t.Fatalf("save plan got %d: %s", result.Code, result.Body.String())
+	}
+
+	getResult := httptest.NewRecorder()
+	app.plan(getResult, httptest.NewRequest(http.MethodGet, "/api/plan", nil))
+	var records []FileRecord
+	if err := json.NewDecoder(getResult.Body).Decode(&records); err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].Path != path || records[0].Advice.RuleID != "TEST" {
+		t.Fatalf("unexpected plan response: %+v", records)
+	}
+}
+
+func TestPlanHandlerWithoutStoreIsReadOnly(t *testing.T) {
+	app := &server{}
+	getResult := httptest.NewRecorder()
+	app.plan(getResult, httptest.NewRequest(http.MethodGet, "/api/plan", nil))
+	if getResult.Code != http.StatusOK || strings.TrimSpace(getResult.Body.String()) != "[]" {
+		t.Fatalf("unexpected empty plan response: %d %s", getResult.Code, getResult.Body.String())
+	}
+	postResult := httptest.NewRecorder()
+	app.plan(postResult, httptest.NewRequest(http.MethodPost, "/api/plan", bytes.NewBufferString(`{"paths":[]}`)))
+	if postResult.Code != http.StatusServiceUnavailable {
+		t.Fatalf("post without store got %d, want 503", postResult.Code)
+	}
+}
+
 func TestVersionStatusAndCancelHandlers(t *testing.T) {
 	app := &server{}
 
 	versionResult := httptest.NewRecorder()
 	app.version(versionResult, httptest.NewRequest(http.MethodGet, "/api/version", nil))
-	if versionResult.Code != http.StatusOK || !strings.Contains(versionResult.Body.String(), "0.3.0-dev") {
+	if versionResult.Code != http.StatusOK || !strings.Contains(versionResult.Body.String(), "0.4.0-dev") {
 		t.Fatalf("unexpected version response: %d %s", versionResult.Code, versionResult.Body.String())
 	}
 

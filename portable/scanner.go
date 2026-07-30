@@ -16,6 +16,9 @@ type FileRecord struct {
 	Size             int64  `json:"size"`
 	ModifiedAt       string `json:"modifiedAt"`
 	ModifiedUnixNano int64  `json:"-"`
+	Identity         string `json:"-"`
+	PhysicalSize     int64  `json:"physicalSize,omitempty"`
+	LinkCount        uint64 `json:"linkCount,omitempty"`
 	Advice           Advice `json:"advice"`
 }
 
@@ -46,6 +49,7 @@ type ScanStatus struct {
 	Root            string           `json:"root"`
 	FilesSeen       int64            `json:"filesSeen"`
 	FilesHashed     int64            `json:"filesHashed"`
+	HashesReused    int64            `json:"hashesReused"`
 	BytesSeen       int64            `json:"bytesSeen"`
 	Errors          int64            `json:"errors"`
 	Excluded        int64            `json:"excluded"`
@@ -64,6 +68,8 @@ type scanJob struct {
 	known           map[string]FileRecord
 	folders         map[string]FolderRecord
 	duplicateByPath map[string]string
+	store           *Store
+	sessionID       string
 }
 
 func (j *scanJob) snapshot() ScanStatus {
@@ -111,6 +117,8 @@ func (j *scanJob) run(ctx context.Context, root string, options ScanOptions) {
 	now := time.Now()
 	direct := map[string]*folderAggregate{root: {}}
 	duplicateCandidates := make([]FileRecord, 0)
+	duplicateIdentities := make(map[string]bool)
+	indexBatch := make([]FileRecord, 0, 256)
 	excludes := newExcludeMatcher(root, options.Excludes)
 
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
@@ -180,16 +188,35 @@ func (j *scanJob) run(ctx context.Context, root string, options ScanOptions) {
 			aggregate.modified = info.ModTime()
 		}
 
-		if info.Size() >= options.Minimum || info.Size() >= options.DuplicateMinimum {
-			record := FileRecord{
-				Path:             path,
-				Size:             info.Size(),
-				ModifiedAt:       info.ModTime().Format("2006-01-02 15:04"),
-				ModifiedUnixNano: info.ModTime().UnixNano(),
-				Advice:           advise(path, info.Size(), info.ModTime(), now),
+		identity, physicalSize, linkCount := fileIdentity(path, info)
+		if identity == "" {
+			identity = "path:" + filepath.Clean(path)
+		}
+		record := FileRecord{
+			Path:             path,
+			Size:             info.Size(),
+			ModifiedAt:       info.ModTime().Format("2006-01-02 15:04"),
+			ModifiedUnixNano: info.ModTime().UnixNano(),
+			Identity:         identity,
+			PhysicalSize:     physicalSize,
+			LinkCount:        linkCount,
+		}
+		if j.store != nil {
+			indexBatch = append(indexBatch, record)
+			if len(indexBatch) == cap(indexBatch) {
+				if saveErr := j.store.saveFiles(indexBatch, j.sessionID); saveErr != nil {
+					j.mu.Lock()
+					j.status.Errors++
+					j.mu.Unlock()
+				}
+				indexBatch = indexBatch[:0]
 			}
-			if info.Size() >= options.DuplicateMinimum {
+		}
+		if info.Size() >= options.Minimum || info.Size() >= options.DuplicateMinimum {
+			record.Advice = advise(path, info.Size(), info.ModTime(), now)
+			if info.Size() >= options.DuplicateMinimum && !duplicateIdentities[identity] {
 				duplicateCandidates = append(duplicateCandidates, record)
+				duplicateIdentities[identity] = true
 			}
 			if info.Size() >= options.Minimum {
 				if found.Len() < options.Limit {
@@ -207,6 +234,13 @@ func (j *scanJob) run(ctx context.Context, root string, options ScanOptions) {
 		}
 		return nil
 	})
+	if j.store != nil && len(indexBatch) > 0 {
+		if saveErr := j.store.saveFiles(indexBatch, j.sessionID); saveErr != nil {
+			j.mu.Lock()
+			j.status.Errors++
+			j.mu.Unlock()
+		}
+	}
 
 	results := sortedRecords(*found)
 	var duplicateGroups []DuplicateGroup
@@ -216,6 +250,9 @@ func (j *scanJob) run(ctx context.Context, root string, options ScanOptions) {
 		j.status.Phase = "duplicates"
 		j.status.CurrentPath = ""
 		j.mu.Unlock()
+		if j.store != nil {
+			_ = j.store.setScanState(j.sessionID, "hashing")
+		}
 		duplicateGroups, duplicateByPath, err = j.findDuplicates(ctx, duplicateCandidates)
 	}
 	paths := make([]string, 0, len(direct))
@@ -262,7 +299,6 @@ func (j *scanJob) run(ctx context.Context, root string, options ScanOptions) {
 	}
 
 	j.mu.Lock()
-	defer j.mu.Unlock()
 	j.status.ElapsedMS = time.Since(j.started).Milliseconds()
 	j.status.Results = results
 	j.status.DuplicateGroups = duplicateGroups
@@ -286,6 +322,16 @@ func (j *scanJob) run(ctx context.Context, root string, options ScanOptions) {
 	default:
 		j.status.State = "done"
 		j.status.Phase = "done"
+	}
+	finalStatus := j.status
+	j.mu.Unlock()
+	if j.store != nil {
+		state := map[string]string{
+			"done":      "completed",
+			"cancelled": "cancelled",
+			"error":     "failed",
+		}[finalStatus.State]
+		_ = j.store.finishScan(j.sessionID, state, finalStatus.Message, finalStatus)
 	}
 }
 

@@ -23,16 +23,30 @@ import (
 //go:embed web/*
 var webFiles embed.FS
 
-var version = "0.3.0-dev"
+var version = "0.4.0-dev"
 
 type server struct {
 	mu    sync.Mutex
 	job   *scanJob
 	token string
+	store *Store
 }
 
 func main() {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	dataDir, err := defaultDataDir()
+	if err != nil {
+		log.Fatal(err)
+	}
+	store, err := openStore(filepath.Join(dataDir, "index.db"))
+	if err != nil {
+		log.Fatalf("打开本地索引失败: %v", err)
+	}
+	defer store.Close()
+	port := os.Getenv("SPACE_SHERIFF_PORT")
+	if port == "" {
+		port = "0"
+	}
+	listener, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", port))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -41,7 +55,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	app := &server{token: token}
+	app := &server{token: token, store: store}
 	mux := http.NewServeMux()
 	mux.Handle("/", http.FileServer(http.FS(staticFiles)))
 	mux.HandleFunc("/api/version", app.version)
@@ -52,14 +66,18 @@ func main() {
 	mux.HandleFunc("/api/cancel", app.cancel)
 	mux.HandleFunc("/api/trash", app.trash)
 	mux.HandleFunc("/api/trash-batch", app.trashBatch)
+	mux.HandleFunc("/api/plan", app.plan)
 	mux.HandleFunc("/api/quit", app.quit)
 	handler := app.secure(mux)
 	url := "http://" + listener.Addr().String() + "/?token=" + app.token
+	log.Printf("本地界面: %s", url)
 
-	go func() {
-		time.Sleep(250 * time.Millisecond)
-		_ = openBrowser(url)
-	}()
+	if os.Getenv("SPACE_SHERIFF_NO_BROWSER") != "1" {
+		go func() {
+			time.Sleep(250 * time.Millisecond)
+			_ = openBrowser(url)
+		}()
+	}
 	if err := http.Serve(listener, handler); err != nil {
 		log.Fatal(err)
 	}
@@ -105,7 +123,7 @@ func writeJSON(w http.ResponseWriter, value any) {
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, value any) bool {
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32*1024)).Decode(value); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 512*1024)).Decode(value); err != nil {
 		http.Error(w, "请求格式无效", http.StatusBadRequest)
 		return false
 	}
@@ -173,6 +191,15 @@ func (s *server) startScan(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "已有扫描任务正在运行", http.StatusConflict)
 		return
 	}
+	sessionID := ""
+	if s.store != nil {
+		sessionID, err = s.store.beginScan(root)
+		if err != nil {
+			s.mu.Unlock()
+			http.Error(w, "无法创建扫描会话", http.StatusInternalServerError)
+			return
+		}
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	job := &scanJob{
 		status:          ScanStatus{State: "running", Phase: "scanning", Root: root},
@@ -181,6 +208,8 @@ func (s *server) startScan(w http.ResponseWriter, r *http.Request) {
 		known:           make(map[string]FileRecord),
 		folders:         make(map[string]FolderRecord),
 		duplicateByPath: make(map[string]string),
+		store:           s.store,
+		sessionID:       sessionID,
 	}
 	s.job = job
 	s.mu.Unlock()
@@ -254,18 +283,27 @@ func (s *server) trash(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	record, err := s.trashOne(request.Path)
+	transactionID, released, results, err := s.executeCleanup([]string{request.Path})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusConflict)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, map[string]string{"released": strconv.FormatInt(record.Size, 10)})
+	if results[0].Error != "" {
+		http.Error(w, results[0].Error, http.StatusConflict)
+		return
+	}
+	writeJSON(w, map[string]string{
+		"released":      strconv.FormatInt(released, 10),
+		"transactionId": transactionID,
+	})
 }
 
 type trashResult struct {
-	Path     string `json:"path"`
-	Released int64  `json:"released"`
-	Error    string `json:"error,omitempty"`
+	Path       string `json:"path"`
+	Released   int64  `json:"released"`
+	State      string `json:"state"`
+	Error      string `json:"error,omitempty"`
+	AuditError string `json:"auditError,omitempty"`
 }
 
 func (s *server) trashBatch(w http.ResponseWriter, r *http.Request) {
@@ -290,25 +328,105 @@ func (s *server) trashBatch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "清理计划必须为每组重复文件至少保留一个副本", http.StatusBadRequest)
 		return
 	}
+	transactionID, released, results, err := s.executeCleanup(request.Paths)
+	if err != nil {
+		http.Error(w, "无法创建清理事务："+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{
+		"transactionId": transactionID,
+		"released":      released,
+		"results":       results,
+	})
+}
+
+func (s *server) executeCleanup(paths []string) (string, int64, []trashResult, error) {
 	seen := make(map[string]bool)
-	results := make([]trashResult, 0, len(request.Paths))
-	var released int64
-	for _, path := range request.Paths {
+	unique := make([]string, 0, len(paths))
+	records := make([]FileRecord, 0, len(paths))
+	s.mu.Lock()
+	job := s.job
+	s.mu.Unlock()
+	for _, path := range paths {
 		if seen[path] {
 			continue
 		}
 		seen[path] = true
-		record, err := s.trashOne(path)
-		result := trashResult{Path: path}
+		unique = append(unique, path)
+		record := FileRecord{Path: path}
+		if job != nil {
+			job.mu.RLock()
+			knownRecord, ok := job.known[path]
+			job.mu.RUnlock()
+			if ok {
+				record = knownRecord
+			}
+		}
+		records = append(records, record)
+	}
+	transactionID := ""
+	var err error
+	if s.store != nil {
+		transactionID, err = s.store.beginCleanup(records)
 		if err != nil {
-			result.Error = err.Error()
+			return "", 0, nil, err
+		}
+	}
+	results := make([]trashResult, 0, len(unique))
+	var released int64
+	successful := make(map[string]bool)
+	for _, path := range unique {
+		record, trashErr := s.trashOne(path)
+		result := trashResult{Path: path, State: "failed"}
+		if trashErr != nil {
+			result.Error = trashErr.Error()
+			if strings.Contains(result.Error, "发生变化") || strings.Contains(result.Error, "类型已经变化") {
+				result.State = "skipped_changed"
+			}
 		} else {
+			result.State = "trashed"
 			result.Released = record.Size
 			released += record.Size
+			successful[path] = true
+		}
+		if s.store != nil {
+			if logErr := s.store.markCleanupItem(
+				transactionID, path, result.State, result.Error, result.Released,
+			); logErr != nil {
+				result.AuditError = "写入逐项审计日志失败：" + logErr.Error()
+			}
 		}
 		results = append(results, result)
 	}
-	writeJSON(w, map[string]any{"released": released, "results": results})
+	if s.store != nil {
+		state := "completed"
+		if len(successful) == 0 {
+			state = "failed"
+		} else if len(successful) != len(unique) {
+			state = "partial"
+		}
+		if err := s.store.finishCleanup(transactionID, state); err != nil {
+			results[0].AuditError = "完成清理事务日志失败：" + err.Error()
+			return transactionID, released, results, nil
+		}
+		if len(successful) > 0 {
+			plan, err := s.store.loadPlan()
+			if err != nil {
+				results[0].AuditError = "更新持久化计划失败：" + err.Error()
+				return transactionID, released, results, nil
+			}
+			remaining := plan[:0]
+			for _, record := range plan {
+				if !successful[record.Path] {
+					remaining = append(remaining, record)
+				}
+			}
+			if err := s.store.replacePlan(remaining); err != nil {
+				results[0].AuditError = "更新持久化计划失败：" + err.Error()
+			}
+		}
+	}
+	return transactionID, released, results, nil
 }
 
 func (s *server) trashOne(path string) (FileRecord, error) {
@@ -355,6 +473,78 @@ func validateTrashCandidate(record FileRecord) error {
 		return fmt.Errorf("文件在扫描后发生变化，已阻止清理，请重新扫描")
 	}
 	return nil
+}
+
+func (s *server) plan(w http.ResponseWriter, r *http.Request) {
+	if s.store == nil {
+		if r.Method == http.MethodGet {
+			writeJSON(w, []FileRecord{})
+			return
+		}
+		http.Error(w, "本地索引不可用", http.StatusServiceUnavailable)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		records, err := s.store.loadPlan()
+		if err != nil {
+			http.Error(w, "读取清理计划失败", http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, records)
+	case http.MethodPost:
+		var request struct {
+			Paths []string `json:"paths"`
+		}
+		if !decodeJSON(w, r, &request) {
+			return
+		}
+		if len(request.Paths) > 500 {
+			http.Error(w, "清理计划最多 500 个文件", http.StatusBadRequest)
+			return
+		}
+		existing, err := s.store.loadPlan()
+		if err != nil {
+			http.Error(w, "读取清理计划失败", http.StatusInternalServerError)
+			return
+		}
+		known := make(map[string]FileRecord, len(existing))
+		for _, record := range existing {
+			known[record.Path] = record
+		}
+		s.mu.Lock()
+		job := s.job
+		s.mu.Unlock()
+		if job != nil {
+			job.mu.RLock()
+			for path, record := range job.known {
+				known[path] = record
+			}
+			job.mu.RUnlock()
+		}
+		records := make([]FileRecord, 0, len(request.Paths))
+		seen := make(map[string]bool)
+		for _, path := range request.Paths {
+			record, ok := known[path]
+			if !ok || seen[path] || record.Advice.Level == "danger" {
+				http.Error(w, "计划包含未知、重复或受保护的文件", http.StatusBadRequest)
+				return
+			}
+			seen[path] = true
+			records = append(records, record)
+		}
+		if job != nil && job.wouldRemoveEveryDuplicate(request.Paths) {
+			http.Error(w, "清理计划必须为每组重复文件至少保留一个副本", http.StatusBadRequest)
+			return
+		}
+		if err := s.store.replacePlan(records); err != nil {
+			http.Error(w, "保存清理计划失败", http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, records)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
 }
 
 func (j *scanJob) removeRecordLocked(record FileRecord) {

@@ -65,9 +65,24 @@ func (j *scanJob) findDuplicates(ctx context.Context, candidates []FileRecord) (
 				return nil, nil, context.Canceled
 			default:
 			}
-			hash, err := hashFile(ctx, record.Path)
+			hash := ""
+			reused := false
+			var err error
+			if j.store != nil {
+				hash, reused, err = j.store.cachedHash(record)
+			}
+			if err == nil && !reused {
+				hash, err = hashFile(ctx, record.Path)
+				if err == nil && j.store != nil {
+					err = j.store.saveFile(record, hash, j.sessionID)
+				}
+			}
 			j.mu.Lock()
-			j.status.FilesHashed++
+			if reused {
+				j.status.HashesReused++
+			} else {
+				j.status.FilesHashed++
+			}
 			j.status.CurrentPath = record.Path
 			if err != nil && err != context.Canceled {
 				j.status.Errors++
