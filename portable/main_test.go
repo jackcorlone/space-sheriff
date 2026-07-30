@@ -45,6 +45,28 @@ func TestSecureRequiresSessionTokenForAPI(t *testing.T) {
 	}
 }
 
+func TestSecureAcceptsJSONCharsetAndRejectsOtherMediaTypes(t *testing.T) {
+	app := &server{token: "expected"}
+	handler := app.secure(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	for contentType, expected := range map[string]int{
+		"application/json; charset=utf-8": http.StatusNoContent,
+		"text/plain":                      http.StatusUnsupportedMediaType,
+		"":                                http.StatusUnsupportedMediaType,
+	} {
+		request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:1234/api/test", strings.NewReader("{}"))
+		request.Host = "127.0.0.1:1234"
+		request.Header.Set("X-Space-Sheriff-Token", "expected")
+		request.Header.Set("Content-Type", contentType)
+		result := httptest.NewRecorder()
+		handler.ServeHTTP(result, request)
+		if result.Code != expected {
+			t.Fatalf("content type %q got %d, want %d", contentType, result.Code, expected)
+		}
+	}
+}
+
 func TestNewSessionTokenAllowsDeterministicLocalTesting(t *testing.T) {
 	t.Setenv("SPACE_SHERIFF_SESSION_TOKEN", "test-token")
 	token, err := newSessionToken()
@@ -68,6 +90,28 @@ func TestNewSessionTokenIsRandomByDefault(t *testing.T) {
 	}
 	if len(first) != 64 || first == second {
 		t.Fatalf("unexpected tokens %q and %q", first, second)
+	}
+}
+
+func TestDecodeJSONRejectsUnknownAndTrailingValues(t *testing.T) {
+	for _, body := range []string{
+		`{"id":"balanced","typo":true}`,
+		`{"id":"balanced"} {"id":"conservative"}`,
+	} {
+		var request struct {
+			ID string `json:"id"`
+		}
+		result := httptest.NewRecorder()
+		if decodeJSON(
+			result,
+			httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body)),
+			&request,
+		) {
+			t.Fatalf("invalid JSON was accepted: %s", body)
+		}
+		if result.Code != http.StatusBadRequest {
+			t.Fatalf("invalid JSON got %d", result.Code)
+		}
 	}
 }
 

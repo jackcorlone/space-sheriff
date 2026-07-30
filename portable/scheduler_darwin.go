@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 type platformScheduleBackend struct{}
@@ -154,6 +155,7 @@ func (platformScheduleBackend) Install(schedule ScanSchedule, executable, dataDi
 		return err
 	}
 	if output, err := exec.Command("launchctl", "bootstrap", launchDomain(), path).CombinedOutput(); err != nil {
+		_ = os.Remove(path)
 		return fmt.Errorf("launchctl bootstrap: %s", string(output))
 	}
 	return nil
@@ -167,14 +169,21 @@ func (platformScheduleBackend) Remove(id string) error {
 	output, commandErr := exec.Command(
 		"launchctl", "bootout", launchDomain()+"/com.spacesheriff.scan."+id,
 	).CombinedOutput()
-	removeErr := os.Remove(path)
-	if commandErr != nil && !os.IsNotExist(removeErr) {
+	if commandErr != nil && !launchctlServiceMissing(string(output)) {
 		return fmt.Errorf("launchctl bootout: %s", string(output))
 	}
+	removeErr := os.Remove(path)
 	if removeErr != nil && !os.IsNotExist(removeErr) {
 		return removeErr
 	}
 	return nil
+}
+
+func launchctlServiceMissing(output string) bool {
+	lower := strings.ToLower(output)
+	return strings.Contains(lower, "could not find") ||
+		strings.Contains(lower, "no such process") ||
+		strings.Contains(lower, "not found")
 }
 
 func (platformScheduleBackend) Name() string {

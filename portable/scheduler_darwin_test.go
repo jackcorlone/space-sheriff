@@ -54,3 +54,18 @@ func TestLaunchAgentBackendMetadata(t *testing.T) {
 		t.Fatal("unexpected backend name")
 	}
 }
+
+func TestLaunchctlMissingServiceMessages(t *testing.T) {
+	for _, message := range []string{
+		"Could not find specified service",
+		"Boot-out failed: 3: No such process",
+		"service not found",
+	} {
+		if !launchctlServiceMissing(message) {
+			t.Fatalf("missing service message not recognized: %q", message)
+		}
+	}
+	if launchctlServiceMissing("Operation not permitted") {
+		t.Fatal("permission error was treated as a missing service")
+	}
+}

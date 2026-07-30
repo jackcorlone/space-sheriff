@@ -27,6 +27,32 @@ func TestScannerFiltersSortsAndLimits(t *testing.T) {
 	}
 }
 
+func TestNormalizeScanRootResolvesDirectorySymlink(t *testing.T) {
+	root := t.TempDir()
+	parent := t.TempDir()
+	alias := filepath.Join(parent, "alias")
+	if err := os.Symlink(root, alias); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	resolved, err := normalizeScanRoot(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved != expected {
+		t.Fatalf("resolved root = %q, want %q", resolved, expected)
+	}
+}
+
+func TestNormalizeScanRootRejectsEmptyPath(t *testing.T) {
+	if _, err := normalizeScanRoot("  "); err == nil {
+		t.Fatal("empty root was accepted")
+	}
+}
+
 func TestScannerAggregatesFolders(t *testing.T) {
 	root := t.TempDir()
 	files := map[string]int{

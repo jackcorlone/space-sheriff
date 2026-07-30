@@ -228,8 +228,25 @@ function resetScheduleForm() {
   $("scheduleCadence").value = "weekly";
   $("scheduleWeekday").value = "6";
   $("scheduleTime").value = "10:00";
+  ["scheduleMinimum", "scheduleDuplicateMinimum"].forEach((id) => {
+    [...$(id).options].filter((option) => option.dataset.custom === "true").forEach((option) => option.remove());
+  });
+  $("scheduleMinimum").value = $("minimum").value;
+  $("scheduleDuplicateMinimum").value = $("duplicateMinimum").value;
+  $("scheduleExcludes").value = $("excludes").value;
   $("weekdayField").classList.remove("hidden");
   $("saveSchedule").textContent = "保存并启用";
+}
+
+function setScheduleSelectValue(id, value) {
+  const select = $(id);
+  const stringValue = String(value);
+  if (![...select.options].some((option) => option.value === stringValue)) {
+    const option = new Option(`${humanSize(value)}（自定义）`, stringValue);
+    option.dataset.custom = "true";
+    select.add(option);
+  }
+  select.value = stringValue;
 }
 
 async function saveScheduleForm() {
@@ -244,10 +261,10 @@ async function saveScheduleForm() {
         cadence: $("scheduleCadence").value,
         hour, minute,
         weekday: Number($("scheduleWeekday").value),
-        minimum: Number($("minimum").value),
-        duplicateMinimum: Number($("duplicateMinimum").value),
+        minimum: Number($("scheduleMinimum").value),
+        duplicateMinimum: Number($("scheduleDuplicateMinimum").value),
         resultLimit: 2000,
-        excludes: $("excludes").value.split("\n").map((value) => value.trim()).filter(Boolean),
+        excludes: $("scheduleExcludes").value.split("\n").map((value) => value.trim()).filter(Boolean),
         enabled: true
       })
     });
@@ -316,9 +333,11 @@ async function updateStatus() {
       renderPlan();
       scanRoot = status.root;
       await loadFolder(status.root);
+      await loadSchedules();
     } else if (status.state === "error") {
       $("status").textContent = "扫描失败";
       toast(status.message);
+      await loadSchedules();
     }
   } catch (error) {
     clearInterval(pollTimer);
@@ -700,6 +719,9 @@ $("scheduleCards").addEventListener("click", async (event) => {
     $("scheduleCadence").value = schedule.cadence;
     $("scheduleWeekday").value = String(schedule.weekday);
     $("scheduleTime").value = `${String(schedule.hour).padStart(2, "0")}:${String(schedule.minute).padStart(2, "0")}`;
+    setScheduleSelectValue("scheduleMinimum", schedule.minimum);
+    setScheduleSelectValue("scheduleDuplicateMinimum", schedule.duplicateMinimum);
+    $("scheduleExcludes").value = schedule.excludes.join("\n");
     $("weekdayField").classList.toggle("hidden", schedule.cadence === "daily");
     $("saveSchedule").textContent = "保存修改并启用";
     return;

@@ -3,7 +3,9 @@ package main
 import (
 	"container/heap"
 	"context"
+	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -112,6 +114,25 @@ type ScanOptions struct {
 	Limit            int
 	Excludes         []string
 	Policy           Policy
+}
+
+func normalizeScanRoot(path string) (string, error) {
+	if strings.TrimSpace(path) == "" {
+		return "", fmt.Errorf("扫描位置不能为空")
+	}
+	absolute, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(resolved)
+	if err != nil || !info.IsDir() {
+		return "", fmt.Errorf("扫描位置不是目录")
+	}
+	return filepath.Abs(resolved)
 }
 
 func (j *scanJob) run(ctx context.Context, root string, options ScanOptions) {

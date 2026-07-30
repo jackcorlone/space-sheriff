@@ -145,6 +145,7 @@ tests/                 Python 测试
 .github/workflows/     CI 与自动发布
 docs/releases/         版本发布说明
 docs/architecture/     架构与可靠性设计
+docs/testing/          版本黑白盒测试报告
 ```
 
 ## 参与贡献与许可证

@@ -13,6 +13,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"mime"
 	"net"
 	"net/http"
 	"os"
@@ -41,6 +42,9 @@ type server struct {
 func main() {
 	if err := runApplication(os.Args[1:]); err != nil {
 		log.Printf("%v", err)
+		if errors.Is(err, errScheduleBusy) {
+			os.Exit(3)
+		}
 		os.Exit(1)
 	}
 }
@@ -184,9 +188,12 @@ func (s *server) secure(next http.Handler) http.Handler {
 			http.Error(w, "invalid session", http.StatusForbidden)
 			return
 		}
-		if r.Method == http.MethodPost && r.Header.Get("Content-Type") != "application/json" {
-			http.Error(w, "application/json required", http.StatusUnsupportedMediaType)
-			return
+		if r.Method == http.MethodPost {
+			mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+			if err != nil || mediaType != "application/json" {
+				http.Error(w, "application/json required", http.StatusUnsupportedMediaType)
+				return
+			}
 		}
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'")
@@ -201,7 +208,14 @@ func writeJSON(w http.ResponseWriter, value any) {
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, value any) bool {
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 512*1024)).Decode(value); err != nil {
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 512*1024))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(value); err != nil {
+		http.Error(w, "请求格式无效", http.StatusBadRequest)
+		return false
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
 		http.Error(w, "请求格式无效", http.StatusBadRequest)
 		return false
 	}
@@ -239,13 +253,8 @@ func (s *server) startScan(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &request) {
 		return
 	}
-	root, err := filepath.Abs(filepath.Clean(request.Path))
+	root, err := normalizeScanRoot(request.Path)
 	if err != nil {
-		http.Error(w, "路径无效", http.StatusBadRequest)
-		return
-	}
-	info, err := os.Stat(root)
-	if err != nil || !info.IsDir() {
 		http.Error(w, "请选择存在的磁盘或文件夹", http.StatusBadRequest)
 		return
 	}

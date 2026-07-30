@@ -6,8 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 )
@@ -70,12 +68,8 @@ func validateSchedule(schedule *ScanSchedule) error {
 	if len([]rune(schedule.Name)) < 1 || len([]rune(schedule.Name)) > 80 {
 		return fmt.Errorf("计划名称必须为 1 到 80 个字符")
 	}
-	root, err := filepath.Abs(filepath.Clean(schedule.Root))
+	root, err := normalizeScanRoot(schedule.Root)
 	if err != nil {
-		return fmt.Errorf("扫描路径无效")
-	}
-	info, err := os.Stat(root)
-	if err != nil || !info.IsDir() {
 		return fmt.Errorf("请选择存在的磁盘或文件夹")
 	}
 	schedule.Root = root
@@ -282,6 +276,25 @@ func (s *Store) releaseScheduleLease(id, owner string) error {
 	return err
 }
 
+func (s *Store) refreshScheduleLease(id, owner string, now time.Time) error {
+	result, err := s.db.Exec(
+		`UPDATE schedule_leases SET acquired_at = ?
+		 WHERE schedule_id = ? AND owner = ?`,
+		now.UnixNano(), id, owner,
+	)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return errScheduleBusy
+	}
+	return nil
+}
+
 func (s *Store) scheduledScanSummaries(limit int) ([]ScheduledScanSummary, error) {
 	rows, err := s.db.Query(
 		`SELECT ss.id, ss.schedule_id, COALESCE(sc.name, '已删除计划'), ss.root,
@@ -397,6 +410,26 @@ func executeSchedule(
 		folders: make(map[string]FolderRecord), duplicateByPath: make(map[string]string),
 		store: store, sessionID: sessionID,
 	}
+	heartbeatStop := make(chan struct{})
+	heartbeatStopped := make(chan struct{})
+	heartbeatError := make(chan error, 1)
+	go func() {
+		defer close(heartbeatStopped)
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case now := <-ticker.C:
+				if err := store.refreshScheduleLease(schedule.ID, owner, now); err != nil {
+					heartbeatError <- err
+					cancel()
+					return
+				}
+			case <-heartbeatStop:
+				return
+			}
+		}
+	}()
 	if onReady != nil {
 		onReady(job)
 	}
@@ -404,6 +437,13 @@ func executeSchedule(
 		Minimum: schedule.Minimum, DuplicateMinimum: schedule.DuplicateMinimum,
 		Limit: schedule.ResultLimit, Excludes: schedule.Excludes, Policy: policy,
 	})
+	close(heartbeatStop)
+	<-heartbeatStopped
+	select {
+	case err := <-heartbeatError:
+		return job, fmt.Errorf("续订计划租约失败: %w", err)
+	default:
+	}
 	status := job.snapshot()
 	if status.State == "error" {
 		return job, fmt.Errorf("%s", status.Message)

@@ -73,7 +73,12 @@ func (platformScheduleBackend) Remove(id string) error {
 	output, err := exec.Command(
 		"schtasks.exe", "/Delete", "/TN", "SpaceSheriff-"+id, "/F",
 	).CombinedOutput()
-	if err != nil && !strings.Contains(strings.ToLower(string(output)), "cannot find") {
+	lower := strings.ToLower(string(output))
+	missing := strings.Contains(lower, "cannot find") ||
+		strings.Contains(lower, "not found") ||
+		strings.Contains(lower, "not exist") ||
+		strings.Contains(string(output), "找不到")
+	if err != nil && !missing {
 		return fmt.Errorf("schtasks delete: %s", string(output))
 	}
 	return nil

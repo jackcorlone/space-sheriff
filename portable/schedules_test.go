@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -66,6 +67,22 @@ func TestScheduleLeaseRejectsOverlapAndRecoversStaleLease(t *testing.T) {
 	if err := store.acquireScheduleLease("schedule", "second", now); err != nil {
 		t.Fatalf("stale lease was not recovered: %v", err)
 	}
+	refreshedAt := now.Add(time.Minute)
+	if err := store.refreshScheduleLease("schedule", "second", refreshedAt); err != nil {
+		t.Fatal(err)
+	}
+	var acquiredAt int64
+	if err := store.db.QueryRow(
+		"SELECT acquired_at FROM schedule_leases WHERE schedule_id = ?", "schedule",
+	).Scan(&acquiredAt); err != nil {
+		t.Fatal(err)
+	}
+	if acquiredAt != refreshedAt.UnixNano() {
+		t.Fatalf("lease timestamp = %d, want %d", acquiredAt, refreshedAt.UnixNano())
+	}
+	if err := store.refreshScheduleLease("schedule", "wrong-owner", time.Now()); !errors.Is(err, errScheduleBusy) {
+		t.Fatalf("wrong owner refresh got %v", err)
+	}
 }
 
 func TestExecuteSchedulePersistsReadOnlyFindings(t *testing.T) {
@@ -95,7 +112,8 @@ func TestExecuteSchedulePersistsReadOnlyFindings(t *testing.T) {
 		t.Fatalf("unexpected summaries: %+v, %v", summaries, err)
 	}
 	detail, err := store.scheduledScanDetail(summaries[0].ID)
-	if err != nil || len(detail.Findings) != 1 || detail.Findings[0].Path != path {
+	expectedPath := filepath.Join(schedule.Root, filepath.Base(path))
+	if err != nil || len(detail.Findings) != 1 || detail.Findings[0].Path != expectedPath {
 		t.Fatalf("unexpected detail: %+v, %v", detail, err)
 	}
 	plan, err := store.loadPlan()
@@ -270,4 +288,41 @@ func TestRunApplicationScheduledModeAndArgumentErrors(t *testing.T) {
 	if err != nil || len(summaries) != 1 || summaries[0].Trigger != "scheduled" {
 		t.Fatalf("unexpected headless result: %+v, %v", summaries, err)
 	}
+}
+
+func TestRunScheduleReportsLeaseConflict(t *testing.T) {
+	store, _ := testStore(t)
+	schedule, err := store.saveSchedule(validTestSchedule(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.acquireScheduleLease(schedule.ID, "other-process", time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	app := &server{store: store}
+	result := httptest.NewRecorder()
+	app.runSchedule(
+		result,
+		httptest.NewRequest(
+			http.MethodPost, "/api/schedules/run",
+			bytes.NewBufferString(`{"id":"`+schedule.ID+`"}`),
+		),
+	)
+	if result.Code != http.StatusOK {
+		t.Fatalf("run got %d: %s", result.Code, result.Body.String())
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		app.mu.Lock()
+		job := app.job
+		app.mu.Unlock()
+		if job != nil && job.snapshot().State == "error" {
+			if !strings.Contains(job.snapshot().Message, "已有扫描") {
+				t.Fatalf("unexpected conflict message: %+v", job.snapshot())
+			}
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("lease conflict was not exposed as an error")
 }

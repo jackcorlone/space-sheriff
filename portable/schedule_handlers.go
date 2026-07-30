@@ -200,13 +200,20 @@ func (s *server) runSchedule(w http.ResponseWriter, r *http.Request) {
 			s.job = ready
 			s.mu.Unlock()
 		})
-		if runErr != nil && job == nil {
-			job = &scanJob{
-				status: ScanStatus{
-					State: "error", Phase: "done", Root: schedule.Root,
-					Message: runErr.Error(),
-				},
-				started: time.Now(), cancel: func() {},
+		if runErr != nil {
+			if job == nil {
+				job = &scanJob{
+					status: ScanStatus{
+						State: "error", Phase: "done", Root: schedule.Root,
+						Message: runErr.Error(),
+					},
+					started: time.Now(), cancel: func() {},
+				}
+			} else {
+				job.mu.Lock()
+				job.status.State = "error"
+				job.status.Message = runErr.Error()
+				job.mu.Unlock()
 			}
 		}
 		s.mu.Lock()

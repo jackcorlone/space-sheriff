@@ -77,6 +77,32 @@ __pycache__</textarea>
           </div>
           <div class="schedule-time">
             <div class="field">
+              <label for="scheduleMinimum">最小文件</label>
+              <select id="scheduleMinimum">
+                <option value="104857600">100 MB</option>
+                <option value="524288000" selected>500 MB</option>
+                <option value="1073741824">1 GB</option>
+                <option value="5368709120">5 GB</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="scheduleDuplicateMinimum">重复检测阈值</label>
+              <select id="scheduleDuplicateMinimum">
+                <option value="1048576">1 MB</option>
+                <option value="10485760" selected>10 MB</option>
+                <option value="104857600">100 MB</option>
+              </select>
+            </div>
+          </div>
+          <div class="field">
+            <label for="scheduleExcludes">排除规则（每行一条）</label>
+            <textarea id="scheduleExcludes" rows="4" spellcheck="false">.git
+node_modules
+.venv
+__pycache__</textarea>
+          </div>
+          <div class="schedule-time">
+            <div class="field">
               <label for="scheduleCadence">周期</label>
               <select id="scheduleCadence">
                 <option value="weekly">每周</option>
