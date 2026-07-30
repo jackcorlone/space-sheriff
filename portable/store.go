@@ -11,11 +11,12 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 1
+const schemaVersion = 2
 const scanSessionRetention = 90 * 24 * time.Hour
 
 type Store struct {
-	db *sql.DB
+	db   *sql.DB
+	path string
 }
 
 type cleanupTransaction struct {
@@ -45,7 +46,7 @@ func openStore(path string) (*Store, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	store := &Store{db: db}
+	store := &Store{db: db, path: path}
 	if err := store.configure(); err != nil {
 		db.Close()
 		return nil, err
@@ -90,9 +91,25 @@ func (s *Store) migrate() error {
 	if current > schemaVersion {
 		return fmt.Errorf("数据库版本 %d 高于应用支持的版本 %d", current, schemaVersion)
 	}
-	if current == schemaVersion {
-		return nil
+	for current < schemaVersion {
+		switch current {
+		case 0:
+			if err := s.migrateV1(); err != nil {
+				return err
+			}
+		case 1:
+			if err := s.migrateV2(); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("不支持从数据库版本 %d 迁移", current)
+		}
+		current++
 	}
+	return s.ensureBuiltInPolicies()
+}
+
+func (s *Store) migrateV1() error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -163,7 +180,46 @@ CREATE TABLE cleanup_items (
 	if _, err := tx.Exec(schema); err != nil {
 		return fmt.Errorf("创建数据库结构: %w", err)
 	}
-	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
+	if _, err := tx.Exec("PRAGMA user_version = 1"); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) migrateV2() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	schema := `
+ALTER TABLE cleanup_transactions ADD COLUMN policy_id TEXT NOT NULL DEFAULT 'balanced';
+ALTER TABLE cleanup_transactions ADD COLUMN policy_version INTEGER NOT NULL DEFAULT 1;
+CREATE TABLE policy_profiles (
+	id TEXT PRIMARY KEY,
+	name TEXT NOT NULL,
+	version INTEGER NOT NULL,
+	description TEXT NOT NULL,
+	built_in INTEGER NOT NULL,
+	document TEXT NOT NULL,
+	created_at INTEGER NOT NULL,
+	updated_at INTEGER NOT NULL
+);
+CREATE TABLE settings (
+	key TEXT PRIMARY KEY,
+	value TEXT NOT NULL
+);
+CREATE TABLE governance_events (
+	id TEXT PRIMARY KEY,
+	event_type TEXT NOT NULL,
+	occurred_at INTEGER NOT NULL,
+	details TEXT NOT NULL
+);
+CREATE INDEX governance_events_time_index ON governance_events(occurred_at DESC);`
+	if _, err := tx.Exec(schema); err != nil {
+		return fmt.Errorf("迁移数据库到 v2: %w", err)
+	}
+	if _, err := tx.Exec("PRAGMA user_version = 2"); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -363,6 +419,10 @@ func (s *Store) beginCleanup(records []FileRecord) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	policy, err := s.activePolicy()
+	if err != nil {
+		return "", err
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return "", err
@@ -373,8 +433,10 @@ func (s *Store) beginCleanup(records []FileRecord) (string, error) {
 		planned += record.Size
 	}
 	if _, err := tx.Exec(
-		`INSERT INTO cleanup_transactions(id, state, started_at, planned_bytes)
-		 VALUES(?, 'prepared', ?, ?)`, id, time.Now().UnixNano(), planned,
+		`INSERT INTO cleanup_transactions(
+		 id, state, started_at, planned_bytes, policy_id, policy_version)
+		 VALUES(?, 'prepared', ?, ?, ?, ?)`,
+		id, time.Now().UnixNano(), planned, policy.ID, policy.Version,
 	); err != nil {
 		return "", err
 	}

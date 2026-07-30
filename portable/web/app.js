@@ -15,6 +15,7 @@ let duplicateGroups = [];
 let plan = new Set();
 let persistedPlanRecords = new Map();
 let planSave = Promise.resolve();
+let policyState = {activeId: "", policies: []};
 let currentFolder = "";
 let scanRoot = "";
 
@@ -74,6 +75,100 @@ function setRunning(running) {
   $("pulse").classList.toggle("active", running);
   $("trashSelected").disabled = running || selected.size === 0;
   $("executePlan").disabled = running || plan.size === 0;
+  $("checkpointDatabase").disabled = running;
+  $("optimizeDatabase").disabled = running;
+}
+
+function policyByID(id) {
+  return policyState.policies.find((policy) => policy.id === id);
+}
+
+function renderPolicy(policy) {
+  if (!policy) {
+    $("policyDescription").textContent = "没有可用策略";
+    $("policyThresholds").innerHTML = "";
+    return;
+  }
+  $("policyDescription").textContent =
+    `${policy.description} · ${policy.builtIn ? "内置策略" : "自定义策略"} · v${policy.version}`;
+  $("policyThresholds").innerHTML = [
+    ["缓存", `${policy.cacheMinAgeDays} 天`],
+    ["高置信缓存", `${policy.cacheHighConfidenceDays} 天`],
+    ["安装包", `${policy.installerMinAgeDays} 天`],
+    ["压缩包", `${policy.archiveMinAgeDays} 天`],
+    ["陈旧大文件", `${humanSize(policy.largeStaleMinBytes)} / ${policy.largeStaleMinAgeDays} 天`]
+  ].map(([label, value]) =>
+    `<div class="metric"><strong>${escapeHTML(value)}</strong><span>${escapeHTML(label)}</span></div>`
+  ).join("");
+  $("activatePolicy").disabled = policy.id === policyState.activeId;
+}
+
+function renderPolicies(state) {
+  policyState = state;
+  $("policySelect").innerHTML = state.policies.map((policy) =>
+    `<option value="${escapeHTML(policy.id)}" ${policy.id === state.activeId ? "selected" : ""}>${escapeHTML(policy.name)} · v${policy.version}${policy.builtIn ? "" : " · 自定义"}</option>`
+  ).join("");
+  renderPolicy(policyByID($("policySelect").value));
+}
+
+function renderHealth(health) {
+  const integrity = health.integrity === "ok" ? "正常" : health.integrity;
+  $("databaseHealth").innerHTML = [
+    ["完整性", integrity],
+    ["Schema", `v${health.schemaVersion}`],
+    ["数据库", humanSize(health.databaseBytes)],
+    ["WAL", humanSize(health.walBytes)],
+    ["索引文件", health.indexedFiles.toLocaleString()],
+    ["扫描会话", health.scanSessions.toLocaleString()],
+    ["清理事务", health.cleanupTransactions.toLocaleString()],
+    ["治理事件", health.governanceEvents.toLocaleString()]
+  ].map(([label, value]) =>
+    `<div class="metric"><strong>${escapeHTML(value)}</strong><span>${escapeHTML(label)}</span></div>`
+  ).join("");
+}
+
+const auditStateLabel = (state) => ({
+  completed: "完成", partial: "部分完成", failed: "失败",
+  interrupted: "中断", executing: "执行中", prepared: "已准备",
+  trashed: "已移入回收站", skipped_changed: "文件已变化", pending: "待处理"
+}[state] || state);
+
+function renderAudit(records) {
+  $("auditSummary").textContent = records.length ? `最近 ${records.length} 条事务` : "尚无清理事务";
+  $("auditRows").innerHTML = records.length ? records.map((record) => `
+    <tr data-id="${escapeHTML(record.id)}">
+      <td>${new Date(record.startedAt / 1e6).toLocaleString()}</td>
+      <td>${escapeHTML(auditStateLabel(record.state))}</td>
+      <td>${escapeHTML(record.policyId)}@${record.policyVersion}</td>
+      <td>${record.itemCount.toLocaleString()} · 成功 ${record.trashedCount} · 失败 ${record.failedCount + record.changedCount}</td>
+      <td>${humanSize(record.plannedBytes)}</td>
+      <td>${humanSize(record.releasedBytes)}</td>
+    </tr>`).join("") :
+    `<tr class="empty"><td colspan="6">尚无清理事务</td></tr>`;
+}
+
+async function loadGovernance() {
+  const [policies, health, audit] = await Promise.all([
+    api("/api/policies"),
+    api("/api/maintenance"),
+    api("/api/audit?limit=20")
+  ]);
+  renderPolicies(policies);
+  renderHealth(health);
+  renderAudit(audit);
+}
+
+async function maintainDatabase(action) {
+  try {
+    const health = await api("/api/maintenance", {
+      method: "POST",
+      body: JSON.stringify({action})
+    });
+    renderHealth(health);
+    toast(action === "optimize" ? "数据库优化完成" : "WAL 空间回收完成");
+  } catch (error) {
+    toast(error.message);
+  }
 }
 
 async function startScan() {
@@ -124,7 +219,7 @@ async function updateStatus() {
     setRunning(false);
     if (["done", "cancelled"].includes(status.state)) {
       $("status").textContent = status.state === "done" ? "扫描完成" : "扫描已停止";
-      $("detail").textContent = `检查 ${status.filesSeen.toLocaleString()} 个文件 · 排除 ${status.excluded.toLocaleString()} 项 · 新计算 ${status.filesHashed.toLocaleString()} 个哈希 · 复用 ${(status.hashesReused || 0).toLocaleString()} 个 · ${status.errors.toLocaleString()} 个错误 · ${(status.elapsedMs / 1000).toFixed(1)} 秒`;
+      $("detail").textContent = `策略 ${status.policyId}@${status.policyVersion} · 检查 ${status.filesSeen.toLocaleString()} 个文件 · 排除 ${status.excluded.toLocaleString()} 项 · 新计算 ${status.filesHashed.toLocaleString()} 个哈希 · 复用 ${(status.hashesReused || 0).toLocaleString()} 个 · ${status.errors.toLocaleString()} 个错误 · ${(status.elapsedMs / 1000).toFixed(1)} 秒`;
       allRecords = status.results || [];
       duplicateGroups = status.duplicateGroups || [];
       updateCategories();
@@ -377,6 +472,7 @@ async function executeCleanupPlan() {
     renderPlan();
     if (currentFolder) await loadFolder(currentFolder);
     await refreshDisk();
+    await loadGovernance();
     toast(`已移入回收站 ${succeeded.size} 个文件，实际释放 ${humanSize(response.released)}`);
     if (response.transactionId) {
       console.info(`Space Sheriff cleanup transaction: ${response.transactionId}`);
@@ -498,6 +594,61 @@ $("clearPlan").addEventListener("click", () => {
 });
 $("executePlan").addEventListener("click", executeCleanupPlan);
 
+$("policySelect").addEventListener("change", () => {
+  renderPolicy(policyByID($("policySelect").value));
+});
+
+$("activatePolicy").addEventListener("click", async () => {
+  try {
+    const state = await api("/api/policies/activate", {
+      method: "POST",
+      body: JSON.stringify({id: $("policySelect").value})
+    });
+    renderPolicies(state);
+    toast(`已启用策略：${policyByID(state.activeId).name}`);
+  } catch (error) {
+    toast(error.message);
+  }
+});
+
+$("importPolicy").addEventListener("click", async () => {
+  try {
+    const policy = await api("/api/policies/import", {
+      method: "POST",
+      body: $("policyJson").value
+    });
+    await loadGovernance();
+    $("policySelect").value = policy.id;
+    renderPolicy(policyByID(policy.id));
+    toast(`已导入策略：${policy.name} v${policy.version}`);
+  } catch (error) {
+    toast(error.message);
+  }
+});
+
+$("checkpointDatabase").addEventListener("click", () => maintainDatabase("checkpoint"));
+$("optimizeDatabase").addEventListener("click", () => maintainDatabase("optimize"));
+$("refreshGovernance").addEventListener("click", () => loadGovernance().catch((error) => toast(error.message)));
+
+$("auditRows").addEventListener("click", async (event) => {
+  const row = event.target.closest("tr[data-id]");
+  if (!row) return;
+  try {
+    const detail = await api(`/api/audit?id=${encodeURIComponent(row.dataset.id)}`);
+    $("auditDetail").innerHTML = `
+      <strong>${escapeHTML(auditStateLabel(detail.state))} · ${escapeHTML(detail.policyId)}@${detail.policyVersion}</strong>
+      <span class="muted"> · 计划 ${humanSize(detail.plannedBytes)} · 实际 ${humanSize(detail.releasedBytes)}</span>
+      <div class="audit-items">${detail.items.map((item) => `
+        <div class="audit-item">
+          <strong>${escapeHTML(auditStateLabel(item.state))}</strong>
+          <span>${humanSize(item.size)}</span>
+          <div class="path">${escapeHTML(item.path)}${item.error ? `<div class="reason">${escapeHTML(item.error)}</div>` : ""}</div>
+        </div>`).join("")}</div>`;
+  } catch (error) {
+    toast(error.message);
+  }
+});
+
 function exportRows() {
   const files = new Map(allRecords.map((item) => [item.path, item]));
   const groupByPath = new Map();
@@ -559,6 +710,6 @@ $("quit").addEventListener("click", async () => {
   document.body.innerHTML = `<main><section class="card status-card"><strong>空间卫士已退出，可以关闭此页面。</strong></section></main>`;
 });
 
-Promise.all([loadRoots(), api("/api/version"), loadPlan()])
+Promise.all([loadRoots(), api("/api/version"), loadPlan(), loadGovernance()])
   .then(([, info]) => { $("version").textContent = `v${info.version}`; })
   .catch((error) => toast(error.message));

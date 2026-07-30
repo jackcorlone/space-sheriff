@@ -4,10 +4,13 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
+	"database/sql"
 	"embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net"
@@ -23,7 +26,7 @@ import (
 //go:embed web/*
 var webFiles embed.FS
 
-var version = "0.4.0-dev"
+var version = "0.5.0-dev"
 
 type server struct {
 	mu    sync.Mutex
@@ -67,6 +70,11 @@ func main() {
 	mux.HandleFunc("/api/trash", app.trash)
 	mux.HandleFunc("/api/trash-batch", app.trashBatch)
 	mux.HandleFunc("/api/plan", app.plan)
+	mux.HandleFunc("/api/policies", app.policies)
+	mux.HandleFunc("/api/policies/activate", app.activatePolicy)
+	mux.HandleFunc("/api/policies/import", app.importPolicy)
+	mux.HandleFunc("/api/audit", app.audit)
+	mux.HandleFunc("/api/maintenance", app.maintenance)
 	mux.HandleFunc("/api/quit", app.quit)
 	handler := app.secure(mux)
 	url := "http://" + listener.Addr().String() + "/?token=" + app.token
@@ -184,6 +192,14 @@ func (s *server) startScan(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "排除规则最多 100 条", http.StatusBadRequest)
 		return
 	}
+	policy := balancedPolicy()
+	if s.store != nil {
+		policy, err = s.store.activePolicy()
+		if err != nil {
+			http.Error(w, "无法读取活动策略", http.StatusInternalServerError)
+			return
+		}
+	}
 
 	s.mu.Lock()
 	if s.job != nil && s.job.snapshot().State == "running" {
@@ -202,7 +218,10 @@ func (s *server) startScan(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	job := &scanJob{
-		status:          ScanStatus{State: "running", Phase: "scanning", Root: root},
+		status: ScanStatus{
+			State: "running", Phase: "scanning", Root: root,
+			PolicyID: policy.ID, PolicyVersion: policy.Version,
+		},
 		started:         time.Now(),
 		cancel:          cancel,
 		known:           make(map[string]FileRecord),
@@ -218,6 +237,7 @@ func (s *server) startScan(w http.ResponseWriter, r *http.Request) {
 		DuplicateMinimum: request.DuplicateMinimum,
 		Limit:            request.Limit,
 		Excludes:         request.Excludes,
+		Policy:           policy,
 	})
 	writeJSON(w, map[string]bool{"started": true})
 }
@@ -542,6 +562,137 @@ func (s *server) plan(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, records)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *server) policies(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	state, err := s.store.policies()
+	if err != nil {
+		http.Error(w, "读取策略失败", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, state)
+}
+
+func (s *server) activatePolicy(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var request struct {
+		ID string `json:"id"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if err := s.store.activatePolicy(request.ID); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	state, err := s.store.policies()
+	if err != nil {
+		http.Error(w, "读取策略失败", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, state)
+}
+
+func (s *server) importPolicy(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 512*1024))
+	if err != nil {
+		http.Error(w, "策略请求过大", http.StatusBadRequest)
+		return
+	}
+	policy, err := decodePolicy(data)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := s.store.importPolicy(policy); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	writeJSON(w, policy)
+}
+
+func (s *server) audit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if id := r.URL.Query().Get("id"); id != "" {
+		detail, err := s.store.auditDetail(id)
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "审计事务不存在", http.StatusNotFound)
+			return
+		}
+		if err != nil {
+			http.Error(w, "读取审计详情失败", http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, detail)
+		return
+	}
+	limit := 20
+	if value := r.URL.Query().Get("limit"); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil || parsed < 1 || parsed > 100 {
+			http.Error(w, "limit 必须在 1 到 100 之间", http.StatusBadRequest)
+			return
+		}
+		limit = parsed
+	}
+	summaries, err := s.store.auditSummaries(limit)
+	if err != nil {
+		http.Error(w, "读取审计记录失败", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, summaries)
+}
+
+func (s *server) maintenance(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		health, err := s.store.databaseHealth()
+		if err != nil {
+			http.Error(w, "读取数据库健康状态失败", http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, health)
+	case http.MethodPost:
+		s.mu.Lock()
+		job := s.job
+		s.mu.Unlock()
+		if job != nil && job.snapshot().State == "running" {
+			http.Error(w, "扫描期间不能执行数据库维护", http.StatusConflict)
+			return
+		}
+		var request struct {
+			Action string `json:"action"`
+		}
+		if !decodeJSON(w, r, &request) {
+			return
+		}
+		if err := s.store.maintain(request.Action); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		health, err := s.store.databaseHealth()
+		if err != nil {
+			http.Error(w, "维护完成但无法读取健康状态", http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, health)
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}

@@ -219,12 +219,90 @@ func TestPlanHandlerWithoutStoreIsReadOnly(t *testing.T) {
 	}
 }
 
+func TestGovernanceHandlers(t *testing.T) {
+	store, _ := testStore(t)
+	app := &server{store: store}
+
+	policiesResult := httptest.NewRecorder()
+	app.policies(policiesResult, httptest.NewRequest(http.MethodGet, "/api/policies", nil))
+	if policiesResult.Code != http.StatusOK {
+		t.Fatalf("policies got %d: %s", policiesResult.Code, policiesResult.Body.String())
+	}
+	var state PolicyState
+	if err := json.NewDecoder(policiesResult.Body).Decode(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state.ActiveID != "balanced" || len(state.Policies) != 3 {
+		t.Fatalf("unexpected policy state: %+v", state)
+	}
+
+	activateResult := httptest.NewRecorder()
+	app.activatePolicy(
+		activateResult,
+		httptest.NewRequest(
+			http.MethodPost, "/api/policies/activate",
+			bytes.NewBufferString(`{"id":"conservative"}`),
+		),
+	)
+	if activateResult.Code != http.StatusOK {
+		t.Fatalf("activate got %d: %s", activateResult.Code, activateResult.Body.String())
+	}
+
+	custom := balancedPolicy()
+	custom.ID = "handler-policy"
+	custom.Name = "Handler Policy"
+	custom.BuiltIn = false
+	document, _ := json.Marshal(custom)
+	importResult := httptest.NewRecorder()
+	app.importPolicy(
+		importResult,
+		httptest.NewRequest(http.MethodPost, "/api/policies/import", bytes.NewReader(document)),
+	)
+	if importResult.Code != http.StatusOK {
+		t.Fatalf("import got %d: %s", importResult.Code, importResult.Body.String())
+	}
+
+	healthResult := httptest.NewRecorder()
+	app.maintenance(healthResult, httptest.NewRequest(http.MethodGet, "/api/maintenance", nil))
+	if healthResult.Code != http.StatusOK || !strings.Contains(healthResult.Body.String(), `"integrity":"ok"`) {
+		t.Fatalf("health got %d: %s", healthResult.Code, healthResult.Body.String())
+	}
+	invalidMaintenance := httptest.NewRecorder()
+	app.maintenance(
+		invalidMaintenance,
+		httptest.NewRequest(http.MethodPost, "/api/maintenance", bytes.NewBufferString(`{"action":"erase"}`)),
+	)
+	if invalidMaintenance.Code != http.StatusBadRequest {
+		t.Fatalf("invalid maintenance got %d, want 400", invalidMaintenance.Code)
+	}
+}
+
+func TestAuditHandlerValidatesQueries(t *testing.T) {
+	store, _ := testStore(t)
+	app := &server{store: store}
+	invalid := httptest.NewRecorder()
+	app.audit(invalid, httptest.NewRequest(http.MethodGet, "/api/audit?limit=200", nil))
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid limit got %d, want 400", invalid.Code)
+	}
+	missing := httptest.NewRecorder()
+	app.audit(missing, httptest.NewRequest(http.MethodGet, "/api/audit?id=missing", nil))
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing audit got %d, want 404", missing.Code)
+	}
+	list := httptest.NewRecorder()
+	app.audit(list, httptest.NewRequest(http.MethodGet, "/api/audit?limit=10", nil))
+	if list.Code != http.StatusOK || strings.TrimSpace(list.Body.String()) != "[]" {
+		t.Fatalf("empty audit got %d: %s", list.Code, list.Body.String())
+	}
+}
+
 func TestVersionStatusAndCancelHandlers(t *testing.T) {
 	app := &server{}
 
 	versionResult := httptest.NewRecorder()
 	app.version(versionResult, httptest.NewRequest(http.MethodGet, "/api/version", nil))
-	if versionResult.Code != http.StatusOK || !strings.Contains(versionResult.Body.String(), "0.4.0-dev") {
+	if versionResult.Code != http.StatusOK || !strings.Contains(versionResult.Body.String(), "0.5.0-dev") {
 		t.Fatalf("unexpected version response: %d %s", versionResult.Code, versionResult.Body.String())
 	}
 

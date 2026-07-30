@@ -9,7 +9,7 @@
 <body>
   <header>
     <div>
-      <div class="eyebrow">SPACE SHERIFF <span id="version">v0.4</span></div>
+      <div class="eyebrow">SPACE SHERIFF <span id="version">v0.5</span></div>
       <h1>看清空间，再安全清理。</h1>
       <p>本地扫描大文件，显示修改时间，并解释每一条删除建议。文件信息不会离开你的电脑。</p>
     </div>
@@ -59,6 +59,70 @@ __pycache__</textarea>
           <span class="hint">可填写目录名、扫描根目录下的相对路径或绝对路径。</span>
         </div>
       </div>
+    </details>
+
+    <details class="card governance">
+      <summary>治理中心 · 策略、审计与数据库健康</summary>
+      <div class="governance-grid">
+        <section class="governance-panel">
+          <h3>清理判断策略</h3>
+          <div class="field">
+            <label for="policySelect">活动策略</label>
+            <select id="policySelect"></select>
+          </div>
+          <p id="policyDescription" class="muted">正在读取策略…</p>
+          <div id="policyThresholds" class="metric-grid"></div>
+          <button id="activatePolicy" class="primary">启用所选策略</button>
+          <p class="hint">策略切换只影响后续扫描，不会自动修改已有结果或执行清理。</p>
+        </section>
+
+        <section class="governance-panel">
+          <h3>导入自定义策略</h3>
+          <textarea id="policyJson" rows="12" spellcheck="false">{
+  "id": "my-policy",
+  "name": "我的策略",
+  "version": 1,
+  "description": "本机自定义阈值",
+  "installerMinAgeDays": 30,
+  "cacheMinAgeDays": 7,
+  "cacheHighConfidenceDays": 30,
+  "archiveMinAgeDays": 90,
+  "largeStaleMinAgeDays": 180,
+  "largeStaleMinBytes": 10737418240
+}</textarea>
+          <button id="importPolicy" class="ghost">校验并导入</button>
+          <p class="hint">只接受固定阈值字段；脚本、表达式和未知字段会被拒绝。</p>
+        </section>
+
+        <section class="governance-panel">
+          <h3>数据库健康</h3>
+          <div id="databaseHealth" class="metric-grid">
+            <span class="muted">正在检查…</span>
+          </div>
+          <div class="governance-actions">
+            <button id="checkpointDatabase" class="ghost">回收 WAL 空间</button>
+            <button id="optimizeDatabase" class="ghost">优化数据库</button>
+          </div>
+          <p class="hint">维护不会删除扫描索引、计划或审计记录；扫描期间不可执行。</p>
+        </section>
+      </div>
+
+      <section class="audit-panel">
+        <div class="results-head">
+          <div>
+            <h3>最近清理事务</h3>
+            <span id="auditSummary" class="muted">正在读取…</span>
+          </div>
+          <button id="refreshGovernance" class="ghost">刷新</button>
+        </div>
+        <div class="table-wrap audit-table">
+          <table>
+            <thead><tr><th>时间</th><th>状态</th><th>策略</th><th>项目</th><th>计划空间</th><th>实际释放</th></tr></thead>
+            <tbody id="auditRows"></tbody>
+          </table>
+        </div>
+        <div id="auditDetail" class="audit-detail muted">选择一条事务查看逐项结果。</div>
+      </section>
     </details>
 
     <section id="disk" class="disk card hidden">

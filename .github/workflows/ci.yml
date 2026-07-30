@@ -27,6 +27,7 @@ jobs:
           cache-dependency-path: |
             portable/go.mod
             portable/go.sum
+      - run: go mod verify
       - run: go test ./...
       - name: Race detection and coverage threshold
         if: runner.os == 'macOS'

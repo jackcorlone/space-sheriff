@@ -47,6 +47,8 @@ type ScanStatus struct {
 	State           string           `json:"state"`
 	Phase           string           `json:"phase"`
 	Root            string           `json:"root"`
+	PolicyID        string           `json:"policyId,omitempty"`
+	PolicyVersion   int              `json:"policyVersion,omitempty"`
 	FilesSeen       int64            `json:"filesSeen"`
 	FilesHashed     int64            `json:"filesHashed"`
 	HashesReused    int64            `json:"hashesReused"`
@@ -109,9 +111,13 @@ type ScanOptions struct {
 	DuplicateMinimum int64
 	Limit            int
 	Excludes         []string
+	Policy           Policy
 }
 
 func (j *scanJob) run(ctx context.Context, root string, options ScanOptions) {
+	if options.Policy.ID == "" {
+		options.Policy = balancedPolicy()
+	}
 	found := &recordHeap{}
 	heap.Init(found)
 	now := time.Now()
@@ -213,7 +219,7 @@ func (j *scanJob) run(ctx context.Context, root string, options ScanOptions) {
 			}
 		}
 		if info.Size() >= options.Minimum || info.Size() >= options.DuplicateMinimum {
-			record.Advice = advise(path, info.Size(), info.ModTime(), now)
+			record.Advice = adviseWithPolicy(options.Policy, path, info.Size(), info.ModTime(), now)
 			if info.Size() >= options.DuplicateMinimum && !duplicateIdentities[identity] {
 				duplicateCandidates = append(duplicateCandidates, record)
 				duplicateIdentities[identity] = true

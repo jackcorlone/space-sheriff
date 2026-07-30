@@ -22,8 +22,8 @@ func TestAdviceAllowsOldCache(t *testing.T) {
 	if got.Level != "safe" {
 		t.Fatalf("got %q, want safe", got.Level)
 	}
-	if got.RuleID != "CACHE_OLD_7D" {
-		t.Fatalf("got rule %q, want CACHE_OLD_7D", got.RuleID)
+	if got.RuleID != "CACHE_OLD" {
+		t.Fatalf("got rule %q, want CACHE_OLD", got.RuleID)
 	}
 }
 
@@ -38,7 +38,7 @@ func TestAdviceProtectsPersonalFile(t *testing.T) {
 func TestAdviceRecognizesOldInstallerInDownloads(t *testing.T) {
 	now := time.Now()
 	got := advise(`C:\Users\me\Downloads\setup.msi`, 100, now.Add(-60*24*time.Hour), now)
-	if got.Level != "safe" || got.RuleID != "INSTALLER_OLD_30D" {
+	if got.Level != "safe" || got.RuleID != "INSTALLER_OLD" {
 		t.Fatalf("unexpected advice: %+v", got)
 	}
 }
