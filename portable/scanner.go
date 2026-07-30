@@ -337,7 +337,14 @@ func (j *scanJob) run(ctx context.Context, root string, options ScanOptions) {
 			"cancelled": "cancelled",
 			"error":     "failed",
 		}[finalStatus.State]
-		_ = j.store.finishScan(j.sessionID, state, finalStatus.Message, finalStatus)
+		if finishErr := j.store.finishScan(
+			j.sessionID, state, finalStatus.Message, finalStatus,
+		); finishErr != nil {
+			j.mu.Lock()
+			j.status.State = "error"
+			j.status.Message = "保存扫描报告失败：" + finishErr.Error()
+			j.mu.Unlock()
+		}
 	}
 }
 

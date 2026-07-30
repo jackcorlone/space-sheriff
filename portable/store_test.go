@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func testStore(t *testing.T) (*Store, string) {
@@ -131,6 +132,12 @@ func TestStoreTracksAndRecoversScanSessions(t *testing.T) {
 	if err := store.setScanState(sessionID, "hashing"); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.db.Exec(
+		"UPDATE scan_sessions SET started_at = ? WHERE id = ?",
+		time.Now().Add(-scheduleLeaseTTL-time.Minute).UnixNano(), sessionID,
+	); err != nil {
+		t.Fatal(err)
+	}
 	completedID, err := store.beginScan(dataDir)
 	if err != nil {
 		t.Fatal(err)
@@ -161,6 +168,33 @@ func TestStoreTracksAndRecoversScanSessions(t *testing.T) {
 	}
 }
 
+func TestStoreDoesNotRecoverRecentWorkFromAnotherProcess(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "index.db")
+	first, err := openStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	sessionID, err := first.beginScan(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := openStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	var state string
+	if err := second.db.QueryRow(
+		"SELECT state FROM scan_sessions WHERE id = ?", sessionID,
+	).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != "walking" {
+		t.Fatalf("recent concurrent scan was changed to %q", state)
+	}
+}
+
 func TestStoreCleanupJournalAndRecovery(t *testing.T) {
 	store, path := testStore(t)
 	record := FileRecord{Path: "/candidate.bin", Identity: "identity", Size: 42, ModifiedUnixNano: 123}
@@ -174,6 +208,12 @@ func TestStoreCleanupJournalAndRecovery(t *testing.T) {
 	}
 	if transaction.State != "executing" || transaction.PlannedBytes != 42 {
 		t.Fatalf("unexpected prepared transaction: %+v", transaction)
+	}
+	if _, err := store.db.Exec(
+		"UPDATE cleanup_transactions SET started_at = ? WHERE id = ?",
+		time.Now().Add(-scheduleLeaseTTL-time.Minute).UnixNano(), transactionID,
+	); err != nil {
+		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)

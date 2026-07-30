@@ -26,39 +26,102 @@ import (
 //go:embed web/*
 var webFiles embed.FS
 
-var version = "0.5.0-dev"
+var version = "0.6.0-dev"
 
 type server struct {
-	mu    sync.Mutex
-	job   *scanJob
-	token string
-	store *Store
+	mu         sync.Mutex
+	job        *scanJob
+	token      string
+	store      *Store
+	backend    scheduleBackend
+	executable string
+	dataDir    string
 }
 
 func main() {
+	if err := runApplication(os.Args[1:]); err != nil {
+		log.Printf("%v", err)
+		os.Exit(1)
+	}
+}
+
+func runApplication(arguments []string) error {
+	var scheduledID, dataDirOverride string
+	for index := 0; index < len(arguments); index++ {
+		switch arguments[index] {
+		case "--scheduled-scan":
+			if index+1 >= len(arguments) {
+				return fmt.Errorf("--scheduled-scan 缺少计划 ID")
+			}
+			index++
+			scheduledID = arguments[index]
+		case "--data-dir":
+			if index+1 >= len(arguments) {
+				return fmt.Errorf("--data-dir 缺少路径")
+			}
+			index++
+			dataDirOverride = arguments[index]
+		default:
+			return fmt.Errorf("未知参数：%s", arguments[index])
+		}
+	}
 	dataDir, err := defaultDataDir()
 	if err != nil {
-		log.Fatal(err)
+		return err
+	}
+	if dataDirOverride != "" {
+		dataDir, err = filepath.Abs(dataDirOverride)
+		if err != nil {
+			return err
+		}
 	}
 	store, err := openStore(filepath.Join(dataDir, "index.db"))
 	if err != nil {
-		log.Fatalf("打开本地索引失败: %v", err)
+		return fmt.Errorf("打开本地索引失败: %w", err)
 	}
 	defer store.Close()
+	if scheduledID != "" {
+		schedule, err := store.schedule(scheduledID)
+		if err != nil {
+			return fmt.Errorf("读取扫描计划失败: %w", err)
+		}
+		job, err := executeSchedule(store, schedule, "scheduled", nil)
+		if err != nil {
+			return err
+		}
+		status := job.snapshot()
+		log.Printf("定时扫描完成：%d 个文件，%d 个结果", status.FilesSeen, len(status.Results))
+		return nil
+	}
+	return runServer(store, dataDir)
+}
+
+func runServer(store *Store, dataDir string) error {
 	port := os.Getenv("SPACE_SHERIFF_PORT")
 	if port == "" {
 		port = "0"
 	}
 	listener, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", port))
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	staticFiles, _ := fs.Sub(webFiles, "web")
 	token, err := newSessionToken()
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
-	app := &server{token: token, store: store}
+	executable, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	executable, err = filepath.Abs(executable)
+	if err != nil {
+		return err
+	}
+	app := &server{
+		token: token, store: store, backend: platformScheduleBackend{},
+		executable: executable, dataDir: dataDir,
+	}
 	mux := http.NewServeMux()
 	mux.Handle("/", http.FileServer(http.FS(staticFiles)))
 	mux.HandleFunc("/api/version", app.version)
@@ -75,6 +138,12 @@ func main() {
 	mux.HandleFunc("/api/policies/import", app.importPolicy)
 	mux.HandleFunc("/api/audit", app.audit)
 	mux.HandleFunc("/api/maintenance", app.maintenance)
+	mux.HandleFunc("/api/schedules", app.schedules)
+	mux.HandleFunc("/api/schedules/save", app.saveSchedule)
+	mux.HandleFunc("/api/schedules/toggle", app.toggleSchedule)
+	mux.HandleFunc("/api/schedules/run", app.runSchedule)
+	mux.HandleFunc("/api/schedules/delete", app.deleteSchedule)
+	mux.HandleFunc("/api/scheduled-scans", app.scheduledScans)
 	mux.HandleFunc("/api/quit", app.quit)
 	handler := app.secure(mux)
 	url := "http://" + listener.Addr().String() + "/?token=" + app.token
@@ -87,8 +156,9 @@ func main() {
 		}()
 	}
 	if err := http.Serve(listener, handler); err != nil {
-		log.Fatal(err)
+		return err
 	}
+	return nil
 }
 
 func newSessionToken() (string, error) {

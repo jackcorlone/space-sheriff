@@ -16,6 +16,7 @@ let plan = new Set();
 let persistedPlanRecords = new Map();
 let planSave = Promise.resolve();
 let policyState = {activeId: "", policies: []};
+let schedulesState = {backend: "", schedules: [], recent: []};
 let currentFolder = "";
 let scanRoot = "";
 
@@ -60,6 +61,7 @@ async function loadRoots() {
   ).join("");
   if (roots.length) {
     $("root").value = roots[0].path;
+    if (!$("scheduleRoot").value) $("scheduleRoot").value = roots[0].path;
     showDisk(roots[0]);
   }
 }
@@ -166,6 +168,92 @@ async function maintainDatabase(action) {
     });
     renderHealth(health);
     toast(action === "optimize" ? "数据库优化完成" : "WAL 空间回收完成");
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+const weekdayNames = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+
+function formatNanoTime(value) {
+  if (!value) return "—";
+  return new Date(Number(value) / 1e6).toLocaleString();
+}
+
+function renderSchedules(state) {
+  schedulesState = state;
+  $("scheduleBackend").textContent = `系统调度器：${state.backend}。计划使用当前用户权限运行。`;
+  $("scheduleSummary").textContent = state.schedules.length
+    ? `${state.schedules.length} 个计划 · ${state.schedules.filter((item) => item.enabled).length} 个启用`
+    : "尚未创建计划";
+  $("scheduleCards").innerHTML = state.schedules.length ? state.schedules.map((item) => {
+    const timing = item.cadence === "daily"
+      ? `每天 ${String(item.hour).padStart(2, "0")}:${String(item.minute).padStart(2, "0")}`
+      : `每周${weekdayNames[item.weekday]} ${String(item.hour).padStart(2, "0")}:${String(item.minute).padStart(2, "0")}`;
+    return `<article class="schedule-card" data-id="${escapeHTML(item.id)}">
+      <div>
+        <strong>${escapeHTML(item.name)} · ${item.enabled ? "已启用" : "已停用"}</strong>
+        <span class="muted">${escapeHTML(timing)} · ${escapeHTML(item.backendState)}</span>
+        <span class="path">${escapeHTML(item.root)}</span>
+        <span class="muted">最近运行：${escapeHTML(formatNanoTime(item.lastRunAt))}</span>
+      </div>
+      <div class="schedule-card-actions">
+        <button class="edit-schedule ghost">编辑</button>
+        <button class="run-schedule ghost">立即扫描</button>
+        <button class="toggle-schedule ghost">${item.enabled ? "停用" : "启用"}</button>
+        <button class="delete-schedule ghost">删除</button>
+      </div>
+      ${item.backendError ? `<div class="backend-error">系统任务错误：${escapeHTML(item.backendError)}</div>` : ""}
+    </article>`;
+  }).join("") : `<div class="muted">创建计划后，操作系统会在指定时间启动一次只读扫描。</div>`;
+  $("scheduledRows").innerHTML = state.recent.length ? state.recent.map((item) => `
+    <tr data-id="${escapeHTML(item.id)}">
+      <td>${escapeHTML(formatNanoTime(item.startedAt))}</td>
+      <td>${escapeHTML(item.scheduleName)}</td>
+      <td>${escapeHTML(item.state)}</td>
+      <td>${Number(item.filesSeen).toLocaleString()}</td>
+      <td>${humanSize(item.bytesSeen)}</td>
+      <td>${Number(item.resultCount).toLocaleString()}</td>
+    </tr>`).join("") : `<tr class="empty"><td colspan="6">尚无计划扫描记录</td></tr>`;
+}
+
+async function loadSchedules() {
+  renderSchedules(await api("/api/schedules"));
+}
+
+function resetScheduleForm() {
+  $("scheduleId").value = "";
+  $("scheduleName").value = "每周空间检查";
+  $("scheduleRoot").value = $("root").value;
+  $("scheduleCadence").value = "weekly";
+  $("scheduleWeekday").value = "6";
+  $("scheduleTime").value = "10:00";
+  $("weekdayField").classList.remove("hidden");
+  $("saveSchedule").textContent = "保存并启用";
+}
+
+async function saveScheduleForm() {
+  const [hour, minute] = $("scheduleTime").value.split(":").map(Number);
+  try {
+    const state = await api("/api/schedules/save", {
+      method: "POST",
+      body: JSON.stringify({
+        id: $("scheduleId").value,
+        name: $("scheduleName").value,
+        root: $("scheduleRoot").value,
+        cadence: $("scheduleCadence").value,
+        hour, minute,
+        weekday: Number($("scheduleWeekday").value),
+        minimum: Number($("minimum").value),
+        duplicateMinimum: Number($("duplicateMinimum").value),
+        resultLimit: 2000,
+        excludes: $("excludes").value.split("\n").map((value) => value.trim()).filter(Boolean),
+        enabled: true
+      })
+    });
+    renderSchedules(state);
+    resetScheduleForm();
+    toast("扫描计划已保存；系统注册状态请查看计划卡片");
   } catch (error) {
     toast(error.message);
   }
@@ -594,6 +682,76 @@ $("clearPlan").addEventListener("click", () => {
 });
 $("executePlan").addEventListener("click", executeCleanupPlan);
 
+$("scheduleCadence").addEventListener("change", () => {
+  $("weekdayField").classList.toggle("hidden", $("scheduleCadence").value === "daily");
+});
+$("saveSchedule").addEventListener("click", saveScheduleForm);
+$("resetSchedule").addEventListener("click", resetScheduleForm);
+$("refreshSchedules").addEventListener("click", () => loadSchedules().catch((error) => toast(error.message)));
+$("scheduleCards").addEventListener("click", async (event) => {
+  const card = event.target.closest(".schedule-card");
+  if (!card) return;
+  const schedule = schedulesState.schedules.find((item) => item.id === card.dataset.id);
+  if (!schedule) return;
+  if (event.target.closest(".edit-schedule")) {
+    $("scheduleId").value = schedule.id;
+    $("scheduleName").value = schedule.name;
+    $("scheduleRoot").value = schedule.root;
+    $("scheduleCadence").value = schedule.cadence;
+    $("scheduleWeekday").value = String(schedule.weekday);
+    $("scheduleTime").value = `${String(schedule.hour).padStart(2, "0")}:${String(schedule.minute).padStart(2, "0")}`;
+    $("weekdayField").classList.toggle("hidden", schedule.cadence === "daily");
+    $("saveSchedule").textContent = "保存修改并启用";
+    return;
+  }
+  try {
+    let state;
+    if (event.target.closest(".run-schedule")) {
+      await api("/api/schedules/run", {method: "POST", body: JSON.stringify({id: schedule.id})});
+      toast("计划扫描已开始，可在状态栏查看进度");
+      clearInterval(pollTimer);
+      pollTimer = setInterval(updateStatus, 500);
+      updateStatus();
+      return;
+    }
+    if (event.target.closest(".toggle-schedule")) {
+      state = await api("/api/schedules/toggle", {
+        method: "POST", body: JSON.stringify({id: schedule.id, enabled: !schedule.enabled})
+      });
+    } else if (event.target.closest(".delete-schedule")) {
+      if (!confirm(`删除扫描计划“${schedule.name}”？历史扫描记录会保留。`)) return;
+      state = await api("/api/schedules/delete", {
+        method: "POST", body: JSON.stringify({id: schedule.id})
+      });
+    } else {
+      return;
+    }
+    renderSchedules(state);
+  } catch (error) {
+    toast(error.message);
+    loadSchedules().catch(() => {});
+  }
+});
+
+$("scheduledRows").addEventListener("click", async (event) => {
+  const row = event.target.closest("tr[data-id]");
+  if (!row) return;
+  try {
+    const detail = await api(`/api/scheduled-scans?id=${encodeURIComponent(row.dataset.id)}`);
+    $("scheduledDetail").innerHTML = `
+      <strong>${escapeHTML(detail.summary.scheduleName)} · ${escapeHTML(detail.summary.state)}</strong>
+      <span class="muted"> · 策略 ${escapeHTML(detail.summary.policyId)}@${detail.summary.policyVersion}</span>
+      <div class="audit-items">${detail.findings.map((item) => `
+        <div class="audit-item">
+          <strong>${humanSize(item.size)}</strong>
+          <span>${escapeHTML(item.advice.label)}</span>
+          <div class="path">${escapeHTML(item.path)}<div class="reason">${escapeHTML(item.modifiedAt)} · ${escapeHTML(item.advice.reason)}</div></div>
+        </div>`).join("") || '<span class="muted">本次运行没有保存结果。</span>'}</div>`;
+  } catch (error) {
+    toast(error.message);
+  }
+});
+
 $("policySelect").addEventListener("change", () => {
   renderPolicy(policyByID($("policySelect").value));
 });
@@ -710,6 +868,6 @@ $("quit").addEventListener("click", async () => {
   document.body.innerHTML = `<main><section class="card status-card"><strong>空间卫士已退出，可以关闭此页面。</strong></section></main>`;
 });
 
-Promise.all([loadRoots(), api("/api/version"), loadPlan(), loadGovernance()])
+Promise.all([loadRoots(), api("/api/version"), loadPlan(), loadGovernance(), loadSchedules()])
   .then(([, info]) => { $("version").textContent = `v${info.version}`; })
   .catch((error) => toast(error.message));

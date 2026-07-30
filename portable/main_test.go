@@ -302,7 +302,7 @@ func TestVersionStatusAndCancelHandlers(t *testing.T) {
 
 	versionResult := httptest.NewRecorder()
 	app.version(versionResult, httptest.NewRequest(http.MethodGet, "/api/version", nil))
-	if versionResult.Code != http.StatusOK || !strings.Contains(versionResult.Body.String(), "0.5.0-dev") {
+	if versionResult.Code != http.StatusOK || !strings.Contains(versionResult.Body.String(), "0.6.0-dev") {
 		t.Fatalf("unexpected version response: %d %s", versionResult.Code, versionResult.Body.String())
 	}
 

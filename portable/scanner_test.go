@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -59,6 +60,29 @@ func TestScannerAggregatesFolders(t *testing.T) {
 	}
 	if view.Children[0].Name != "a" || view.Children[0].Size != 30 || view.Children[0].FileCount != 2 {
 		t.Fatalf("unexpected largest folder: %+v", view.Children[0])
+	}
+}
+
+func TestScannerReportsPersistenceFailure(t *testing.T) {
+	store, _ := testStore(t)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "file.bin"), []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	job := &scanJob{
+		status: ScanStatus{State: "running", Root: root}, started: time.Now(),
+		known: make(map[string]FileRecord), folders: make(map[string]FolderRecord),
+		store: store, sessionID: "session",
+	}
+	job.run(context.Background(), root, ScanOptions{
+		Minimum: 0, DuplicateMinimum: 1 << 60, Limit: 10,
+	})
+	status := job.snapshot()
+	if status.State != "error" || !strings.Contains(status.Message, "保存扫描报告失败") {
+		t.Fatalf("persistence failure was hidden: %+v", status)
 	}
 }
 

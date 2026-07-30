@@ -9,7 +9,7 @@
 <body>
   <header>
     <div>
-      <div class="eyebrow">SPACE SHERIFF <span id="version">v0.5</span></div>
+      <div class="eyebrow">SPACE SHERIFF <span id="version">v0.6</span></div>
       <h1>看清空间，再安全清理。</h1>
       <p>本地扫描大文件，显示修改时间，并解释每一条删除建议。文件信息不会离开你的电脑。</p>
     </div>
@@ -59,6 +59,72 @@ __pycache__</textarea>
           <span class="hint">可填写目录名、扫描根目录下的相对路径或绝对路径。</span>
         </div>
       </div>
+    </details>
+
+    <details class="card schedules">
+      <summary>定时扫描 · 只读后台报告</summary>
+      <div class="schedule-grid">
+        <section class="governance-panel">
+          <h3>扫描计划</h3>
+          <input id="scheduleId" type="hidden">
+          <div class="field">
+            <label for="scheduleName">计划名称</label>
+            <input id="scheduleName" maxlength="80" value="每周空间检查">
+          </div>
+          <div class="field">
+            <label for="scheduleRoot">扫描位置</label>
+            <input id="scheduleRoot" spellcheck="false" placeholder="磁盘或文件夹绝对路径">
+          </div>
+          <div class="schedule-time">
+            <div class="field">
+              <label for="scheduleCadence">周期</label>
+              <select id="scheduleCadence">
+                <option value="weekly">每周</option>
+                <option value="daily">每天</option>
+              </select>
+            </div>
+            <div class="field" id="weekdayField">
+              <label for="scheduleWeekday">星期</label>
+              <select id="scheduleWeekday">
+                <option value="0">周日</option><option value="1">周一</option>
+                <option value="2">周二</option><option value="3">周三</option>
+                <option value="4">周四</option><option value="5">周五</option>
+                <option value="6" selected>周六</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="scheduleTime">本地时间</label>
+              <input id="scheduleTime" type="time" value="10:00">
+            </div>
+          </div>
+          <div class="governance-actions">
+            <button id="saveSchedule" class="primary">保存并启用</button>
+            <button id="resetSchedule" class="ghost">新建计划</button>
+          </div>
+          <p id="scheduleBackend" class="hint">正在读取系统任务能力…</p>
+          <p class="hint">后台任务只扫描、计算哈希并保存报告，绝不会移动或删除文件。</p>
+        </section>
+
+        <section class="schedule-list-panel">
+          <div class="results-head">
+            <div><h3>已保存计划</h3><span id="scheduleSummary" class="muted">正在读取…</span></div>
+            <button id="refreshSchedules" class="ghost">刷新</button>
+          </div>
+          <div id="scheduleCards" class="schedule-cards"></div>
+        </section>
+      </div>
+      <section class="audit-panel">
+        <div class="results-head">
+          <div><h3>最近计划扫描</h3><span class="muted">点击记录查看保存的大文件结果</span></div>
+        </div>
+        <div class="table-wrap audit-table">
+          <table>
+            <thead><tr><th>时间</th><th>计划</th><th>状态</th><th>文件</th><th>扫描空间</th><th>结果</th></tr></thead>
+            <tbody id="scheduledRows"></tbody>
+          </table>
+        </div>
+        <div id="scheduledDetail" class="audit-detail muted">尚未选择扫描记录。</div>
+      </section>
     </details>
 
     <details class="card governance">

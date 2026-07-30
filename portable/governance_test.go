@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-func TestStoreMigratesV1DatabaseToV2(t *testing.T) {
+func TestStoreMigratesV1DatabaseToCurrentVersion(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "v1.db")
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -51,7 +51,7 @@ func TestStoreMigratesV1DatabaseToV2(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version != 2 || state.ActiveID != "balanced" || len(state.Policies) != 3 {
+	if version != schemaVersion || state.ActiveID != "balanced" || len(state.Policies) != 3 {
 		t.Fatalf("unexpected migrated state: version=%d policies=%+v", version, state)
 	}
 	audit, err := store.auditDetail("legacy")
@@ -134,7 +134,7 @@ func TestStoreAuditAndMaintenance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if health.SchemaVersion != 2 || health.CleanupTransactions != 1 || health.Integrity != "ok" {
+	if health.SchemaVersion != schemaVersion || health.CleanupTransactions != 1 || health.Integrity != "ok" {
 		t.Fatalf("unexpected database health: %+v", health)
 	}
 	if err := store.maintain("checkpoint"); err != nil {

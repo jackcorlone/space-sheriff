@@ -11,7 +11,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 2
+const schemaVersion = 3
 const scanSessionRetention = 90 * 24 * time.Hour
 
 type Store struct {
@@ -99,6 +99,10 @@ func (s *Store) migrate() error {
 			}
 		case 1:
 			if err := s.migrateV2(); err != nil {
+				return err
+			}
+		case 2:
+			if err := s.migrateV3(); err != nil {
 				return err
 			}
 		default:
@@ -225,6 +229,66 @@ CREATE INDEX governance_events_time_index ON governance_events(occurred_at DESC)
 	return tx.Commit()
 }
 
+func (s *Store) migrateV3() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	schema := `
+ALTER TABLE scan_sessions ADD COLUMN schedule_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE scan_sessions ADD COLUMN trigger TEXT NOT NULL DEFAULT 'interactive';
+ALTER TABLE scan_sessions ADD COLUMN policy_id TEXT NOT NULL DEFAULT 'balanced';
+ALTER TABLE scan_sessions ADD COLUMN policy_version INTEGER NOT NULL DEFAULT 1;
+CREATE TABLE scan_schedules (
+	id TEXT PRIMARY KEY,
+	name TEXT NOT NULL,
+	root TEXT NOT NULL,
+	cadence TEXT NOT NULL,
+	hour INTEGER NOT NULL,
+	minute INTEGER NOT NULL,
+	weekday INTEGER NOT NULL,
+	minimum_bytes INTEGER NOT NULL,
+	duplicate_minimum_bytes INTEGER NOT NULL,
+	result_limit INTEGER NOT NULL,
+	excludes_json TEXT NOT NULL,
+	enabled INTEGER NOT NULL,
+	backend_state TEXT NOT NULL,
+	backend_error TEXT NOT NULL DEFAULT '',
+	created_at INTEGER NOT NULL,
+	updated_at INTEGER NOT NULL,
+	last_run_at INTEGER
+);
+CREATE TABLE scan_findings (
+	session_id TEXT NOT NULL,
+	path TEXT NOT NULL,
+	size INTEGER NOT NULL,
+	modified_at INTEGER NOT NULL,
+	modified_display TEXT NOT NULL,
+	advice_level TEXT NOT NULL,
+	advice_label TEXT NOT NULL,
+	advice_reason TEXT NOT NULL,
+	advice_rule_id TEXT NOT NULL,
+	advice_category TEXT NOT NULL,
+	PRIMARY KEY(session_id, path),
+	FOREIGN KEY(session_id) REFERENCES scan_sessions(id) ON DELETE CASCADE
+);
+CREATE TABLE schedule_leases (
+	schedule_id TEXT PRIMARY KEY,
+	owner TEXT NOT NULL,
+	acquired_at INTEGER NOT NULL
+);
+CREATE INDEX scan_sessions_schedule_time_index
+	ON scan_sessions(schedule_id, started_at DESC);`
+	if _, err := tx.Exec(schema); err != nil {
+		return fmt.Errorf("迁移数据库到 v3: %w", err)
+	}
+	if _, err := tx.Exec("PRAGMA user_version = 3"); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) recoverInterrupted() error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -234,13 +298,15 @@ func (s *Store) recoverInterrupted() error {
 	now := time.Now().UnixNano()
 	if _, err := tx.Exec(
 		`UPDATE scan_sessions SET state = 'failed', completed_at = ?, message = '上次进程中断'
-		 WHERE state IN ('walking', 'hashing')`, now,
+		 WHERE state IN ('walking', 'hashing') AND started_at < ?`,
+		now, time.Now().Add(-scheduleLeaseTTL).UnixNano(),
 	); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(
 		`UPDATE cleanup_transactions SET state = 'interrupted', completed_at = ?
-		 WHERE state IN ('prepared', 'executing')`, now,
+		 WHERE state IN ('prepared', 'executing') AND started_at < ?`,
+		now, time.Now().Add(-scheduleLeaseTTL).UnixNano(),
 	); err != nil {
 		return err
 	}
@@ -255,13 +321,19 @@ func (s *Store) recoverInterrupted() error {
 }
 
 func (s *Store) beginScan(root string) (string, error) {
+	return s.beginScanWithContext(root, "", "interactive", balancedPolicy())
+}
+
+func (s *Store) beginScanWithContext(root, scheduleID, trigger string, policy Policy) (string, error) {
 	id, err := newID()
 	if err != nil {
 		return "", err
 	}
 	_, err = s.db.Exec(
-		`INSERT INTO scan_sessions(id, root, state, started_at) VALUES(?, ?, 'walking', ?)`,
-		id, root, time.Now().UnixNano(),
+		`INSERT INTO scan_sessions(
+		 id, root, state, started_at, schedule_id, trigger, policy_id, policy_version)
+		 VALUES(?, ?, 'walking', ?, ?, ?, ?, ?)`,
+		id, root, time.Now().UnixNano(), scheduleID, trigger, policy.ID, policy.Version,
 	)
 	return id, err
 }
@@ -272,13 +344,46 @@ func (s *Store) setScanState(id, state string) error {
 }
 
 func (s *Store) finishScan(id, state, message string, status ScanStatus) error {
-	_, err := s.db.Exec(
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(
 		`UPDATE scan_sessions SET state = ?, completed_at = ?, files_seen = ?, bytes_seen = ?,
 		 errors = ?, excluded = ?, hashes_reused = ?, message = ? WHERE id = ?`,
 		state, time.Now().UnixNano(), status.FilesSeen, status.BytesSeen,
 		status.Errors, status.Excluded, status.HashesReused, message, id,
+	); err != nil {
+		return err
+	}
+	statement, err := tx.Prepare(
+		`INSERT INTO scan_findings(
+		 session_id, path, size, modified_at, modified_display, advice_level,
+		 advice_label, advice_reason, advice_rule_id, advice_category)
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	defer statement.Close()
+	for _, record := range status.Results {
+		if _, err := statement.Exec(
+			id, record.Path, record.Size, record.ModifiedUnixNano, record.ModifiedAt,
+			record.Advice.Level, record.Advice.Label, record.Advice.Reason,
+			record.Advice.RuleID, record.Advice.Category,
+		); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(
+		`UPDATE scan_schedules SET last_run_at = ? WHERE id =
+		 (SELECT schedule_id FROM scan_sessions WHERE id = ?)`,
+		time.Now().UnixNano(), id,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) cachedHash(record FileRecord) (string, bool, error) {
