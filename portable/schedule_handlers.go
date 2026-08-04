@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"time"
@@ -13,6 +14,7 @@ type scheduleState struct {
 	Backend   string                 `json:"backend"`
 	Schedules []ScanSchedule         `json:"schedules"`
 	Recent    []ScheduledScanSummary `json:"recent"`
+	Alerts    []ScheduleAlert        `json:"alerts"`
 }
 
 func (s *server) scheduleState() (scheduleState, error) {
@@ -24,11 +26,82 @@ func (s *server) scheduleState() (scheduleState, error) {
 	if err != nil {
 		return scheduleState{}, err
 	}
+	alerts := make([]ScheduleAlert, 0)
+	now := time.Now()
+	inspector, canInspect := s.backend.(scheduleInspector)
+	for index := range schedules {
+		schedule := &schedules[index]
+		if schedule.Enabled {
+			schedule.NextRunAt = nextScheduleRun(*schedule, now).UnixNano()
+			schedule.MissedRuns = missedScheduleRuns(*schedule, now)
+		}
+		if latest, latestErr := s.store.latestScheduledScan(schedule.ID); latestErr == nil {
+			schedule.LastRunState = latest.State
+			schedule.LastRunMessage = latest.Message
+			if latest.State == "failed" || latest.State == "budget_exceeded" {
+				message := latest.Message
+				kind := "failure"
+				if latest.State == "budget_exceeded" {
+					kind = "budget"
+				}
+				if message == "" {
+					if kind == "budget" {
+						message = "最近一次计划扫描达到资源预算"
+					} else {
+						message = "最近一次计划扫描失败"
+					}
+				}
+				alerts = append(alerts, ScheduleAlert{
+					ScheduleID: schedule.ID, ScheduleName: schedule.Name,
+					Kind: kind, Message: message, OccurredAt: latest.CompletedAt,
+				})
+			}
+		} else if !errors.Is(latestErr, sql.ErrNoRows) {
+			return scheduleState{}, latestErr
+		}
+		if schedule.MissedRuns > 0 {
+			alerts = append(alerts, ScheduleAlert{
+				ScheduleID: schedule.ID, ScheduleName: schedule.Name,
+				Kind: "missed", Message: fmt.Sprintf("已错过 %d 次计划运行", schedule.MissedRuns),
+			})
+		}
+		if schedule.BackendState == "error" {
+			message := schedule.BackendError
+			if message == "" {
+				message = "系统任务注册失败"
+			}
+			alerts = append(alerts, ScheduleAlert{
+				ScheduleID: schedule.ID, ScheduleName: schedule.Name,
+				Kind: "backend", Message: message,
+			})
+		}
+		if canInspect {
+			inspection, inspectErr := inspector.Inspect(*schedule, s.executable, s.dataDir)
+			if inspectErr != nil && inspection.Message == "" {
+				inspection.Message = inspectErr.Error()
+			}
+			if inspection.State == "" {
+				inspection.State = "unknown"
+			}
+			schedule.DriftState = inspection.State
+			schedule.DriftMessage = inspection.Message
+			if inspection.State == "missing" || inspection.State == "drifted" || inspection.State == "unknown" {
+				message := inspection.Message
+				if message == "" {
+					message = "系统任务状态需要检查"
+				}
+				alerts = append(alerts, ScheduleAlert{
+					ScheduleID: schedule.ID, ScheduleName: schedule.Name,
+					Kind: "drift", Message: message,
+				})
+			}
+		}
+	}
 	backendName := "不可用"
 	if s.backend != nil {
 		backendName = s.backend.Name()
 	}
-	return scheduleState{Backend: backendName, Schedules: schedules, Recent: recent}, nil
+	return scheduleState{Backend: backendName, Schedules: schedules, Recent: recent, Alerts: alerts}, nil
 }
 
 func (s *server) schedules(w http.ResponseWriter, r *http.Request) {
@@ -96,6 +169,39 @@ func (s *server) reconcileSchedule(schedule ScanSchedule) {
 		return
 	}
 	_ = s.store.setScheduleBackend(schedule.ID, state, "")
+}
+
+func (s *server) repairSchedule(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var request struct {
+		ID string `json:"id"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	schedule, err := s.store.schedule(request.ID)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.Error(w, "扫描计划不存在", http.StatusNotFound)
+		return
+	}
+	if err != nil {
+		http.Error(w, "读取扫描计划失败", http.StatusInternalServerError)
+		return
+	}
+	if s.backend == nil {
+		http.Error(w, "当前平台没有可用的任务注册器", http.StatusServiceUnavailable)
+		return
+	}
+	s.reconcileSchedule(schedule)
+	state, err := s.scheduleState()
+	if err != nil {
+		http.Error(w, "修复后无法刷新状态", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, state)
 }
 
 func (s *server) toggleSchedule(w http.ResponseWriter, r *http.Request) {

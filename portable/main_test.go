@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,6 +12,28 @@ import (
 	"testing"
 	"time"
 )
+
+func captureStdout(t *testing.T, fn func() error) string {
+	t.Helper()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := os.Stdout
+	os.Stdout = writer
+	callErr := fn()
+	_ = writer.Close()
+	os.Stdout = original
+	output, readErr := io.ReadAll(reader)
+	_ = reader.Close()
+	if callErr != nil {
+		t.Fatal(callErr)
+	}
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	return string(output)
+}
 
 func TestSecureRequiresSessionTokenForAPI(t *testing.T) {
 	app := &server{token: "expected"}
@@ -216,7 +239,7 @@ func TestTrashBatchKeepsOneDuplicateCopy(t *testing.T) {
 
 func TestPlanHandlerPersistsKnownRecords(t *testing.T) {
 	store, _ := testStore(t)
-	path := filepath.Join(t.TempDir(), "candidate.bin")
+	path := filepath.Join("workspace", "candidate.bin")
 	record := FileRecord{
 		Path:             path,
 		Identity:         "identity",
@@ -246,6 +269,28 @@ func TestPlanHandlerPersistsKnownRecords(t *testing.T) {
 	}
 	if len(records) != 1 || records[0].Path != path || records[0].Advice.RuleID != "TEST" {
 		t.Fatalf("unexpected plan response: %+v", records)
+	}
+}
+
+func TestPlanHandlerHidesProtectedRecords(t *testing.T) {
+	store, _ := testStore(t)
+	if err := store.replacePlan([]FileRecord{
+		{Path: "workspace/candidate.bin", Advice: Advice{Level: "review"}},
+		{Path: "/System/Library/AssetsV2/mock.dmg", Advice: Advice{Level: "safe"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result := httptest.NewRecorder()
+	(&server{store: store}).plan(result, httptest.NewRequest(http.MethodGet, "/api/plan", nil))
+	if result.Code != http.StatusOK {
+		t.Fatalf("get plan got %d: %s", result.Code, result.Body.String())
+	}
+	var records []FileRecord
+	if err := json.NewDecoder(result.Body).Decode(&records); err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].Path != "workspace/candidate.bin" {
+		t.Fatalf("protected record was exposed: %+v", records)
 	}
 }
 
@@ -346,7 +391,9 @@ func TestVersionStatusAndCancelHandlers(t *testing.T) {
 
 	versionResult := httptest.NewRecorder()
 	app.version(versionResult, httptest.NewRequest(http.MethodGet, "/api/version", nil))
-	if versionResult.Code != http.StatusOK || !strings.Contains(versionResult.Body.String(), "0.6.0-dev") {
+	if versionResult.Code != http.StatusOK || !strings.Contains(versionResult.Body.String(), `"version":"1.0.0"`) ||
+		!strings.Contains(versionResult.Body.String(), `"apiVersion":"v1"`) ||
+		!strings.Contains(versionResult.Body.String(), `"schemaVersion":4`) {
 		t.Fatalf("unexpected version response: %d %s", versionResult.Code, versionResult.Body.String())
 	}
 
@@ -365,13 +412,57 @@ func TestVersionStatusAndCancelHandlers(t *testing.T) {
 	}
 }
 
+func TestStableCLIHelpAndVersion(t *testing.T) {
+	versionOutput := captureStdout(t, func() error {
+		return runApplication([]string{"--version"})
+	})
+	if strings.TrimSpace(versionOutput) != "1.0.0" {
+		t.Fatalf("version output = %q", versionOutput)
+	}
+	dataDir := filepath.Join(t.TempDir(), "not-created")
+	helpOutput := captureStdout(t, func() error {
+		return runApplication([]string{"--scheduled-scan", "--help", "--data-dir", dataDir})
+	})
+	for _, expected := range []string{"--scheduled-scan PLAN_ID", "--data-dir PATH", "--version"} {
+		if !strings.Contains(helpOutput, expected) {
+			t.Fatalf("help output missing %q: %s", expected, helpOutput)
+		}
+	}
+	if _, err := os.Stat(dataDir); !os.IsNotExist(err) {
+		t.Fatalf("help unexpectedly initialized data dir: %v", err)
+	}
+}
+
+func TestQuitCancelsActiveScan(t *testing.T) {
+	done := make(chan struct{})
+	cancelled := false
+	app := &server{job: &scanJob{
+		status: ScanStatus{State: "running"},
+		cancel: func() {
+			cancelled = true
+			close(done)
+		},
+		done: done,
+	}}
+	result := httptest.NewRecorder()
+	app.quit(result, httptest.NewRequest(http.MethodPost, "/api/quit", nil))
+	if result.Code != http.StatusOK || !cancelled {
+		t.Fatalf("quit did not cancel active scan: code=%d cancelled=%v", result.Code, cancelled)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("quit did not finish scan cancellation")
+	}
+}
+
 func TestStartScanValidatesAndCompletes(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "file.bin"), []byte("content"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	app := &server{}
-	body := bytes.NewBufferString(`{"path":` + strconvQuote(root) + `,"minimum":0,"duplicateMinimum":1,"limit":20,"excludes":[".git"]}`)
+	body := bytes.NewBufferString(`{"path":` + strconvQuote(root) + `,"minimum":0,"duplicateMinimum":1048576,"limit":20,"excludes":[".git"]}`)
 	result := httptest.NewRecorder()
 	app.startScan(result, httptest.NewRequest(http.MethodPost, "/api/scan", body))
 	if result.Code != http.StatusOK {
@@ -386,11 +477,39 @@ func TestStartScanValidatesAndCompletes(t *testing.T) {
 		t.Fatalf("unexpected completed scan: %+v", status)
 	}
 
+	budgetApp := &server{}
+	budgetResult := httptest.NewRecorder()
+	budgetBody := bytes.NewBufferString(`{"path":` + strconvQuote(root) + `,"minimum":0,"maxBytes":1}`)
+	budgetApp.startScan(budgetResult, httptest.NewRequest(http.MethodPost, "/api/scan", budgetBody))
+	if budgetResult.Code != http.StatusOK {
+		t.Fatalf("budget scan start got %d: %s", budgetResult.Code, budgetResult.Body.String())
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for budgetApp.job.snapshot().State == "running" && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if status := budgetApp.job.snapshot(); status.State != "budget_exceeded" || status.BudgetExceeded == "" {
+		t.Fatalf("budget scan did not stop explicitly: %+v", status)
+	}
+
 	invalidResult := httptest.NewRecorder()
 	invalidBody := bytes.NewBufferString(`{"path":"/path/that/does/not/exist"}`)
 	app.startScan(invalidResult, httptest.NewRequest(http.MethodPost, "/api/scan", invalidBody))
 	if invalidResult.Code != http.StatusBadRequest {
 		t.Fatalf("invalid path got %d, want 400", invalidResult.Code)
+	}
+	for _, body := range []string{
+		`{"path":` + strconvQuote(root) + `,"minimum":-1}`,
+		`{"path":` + strconvQuote(root) + `,"duplicateMinimum":1}`,
+		`{"path":` + strconvQuote(root) + `,"limit":0}`,
+		`{"path":` + strconvQuote(root) + `,"maxBytes":-1}`,
+		`{"path":` + strconvQuote(root) + `,"maxDurationSeconds":604801}`,
+	} {
+		invalidOptions := httptest.NewRecorder()
+		app.startScan(invalidOptions, httptest.NewRequest(http.MethodPost, "/api/scan", strings.NewReader(body)))
+		if invalidOptions.Code != http.StatusBadRequest {
+			t.Fatalf("invalid scan options got %d for %s", invalidOptions.Code, body)
+		}
 	}
 }
 
@@ -415,11 +534,18 @@ func TestTrashOneRejectsUnsafeStates(t *testing.T) {
 
 	app.job.status.State = "done"
 	app.job.known["system"] = FileRecord{Path: "system", Advice: Advice{Level: "danger"}}
+	app.job.known["system-installer"] = FileRecord{
+		Path:   "/System/Library/AssetsV2/mock.dmg",
+		Advice: Advice{Level: "safe"},
+	}
 	if _, err := app.trashOne("unknown"); err == nil {
 		t.Fatal("unknown file was allowed")
 	}
 	if _, err := app.trashOne("system"); err == nil {
 		t.Fatal("protected file was allowed")
+	}
+	if _, err := app.trashOne("system-installer"); err == nil {
+		t.Fatal("protected system installer was allowed")
 	}
 }
 

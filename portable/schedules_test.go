@@ -24,11 +24,15 @@ func validTestSchedule(root string) ScanSchedule {
 
 func TestScheduleValidationAndPersistence(t *testing.T) {
 	store, _ := testStore(t)
-	schedule, err := store.saveSchedule(validTestSchedule(t.TempDir()))
+	input := validTestSchedule(t.TempDir())
+	input.MaxBytes = 256 * 1024 * 1024
+	input.MaxDurationSeconds = 90 * 60
+	schedule, err := store.saveSchedule(input)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if schedule.ID == "" || schedule.BackendState != "disabled" ||
+		schedule.MaxBytes != input.MaxBytes || schedule.MaxDurationSeconds != input.MaxDurationSeconds ||
 		len(schedule.Excludes) != 1 {
 		t.Fatalf("unexpected schedule: %+v", schedule)
 	}
@@ -46,6 +50,40 @@ func TestScheduleValidationAndPersistence(t *testing.T) {
 	invalid.DuplicateMinimum = 1
 	if _, err := store.saveSchedule(invalid); err == nil {
 		t.Fatal("invalid duplicate threshold was accepted")
+	}
+}
+
+func TestScheduleRunTimesAndMissedRuns(t *testing.T) {
+	loc := time.Local
+	now := time.Date(2026, time.August, 2, 12, 0, 0, 0, loc)
+	daily := validTestSchedule(t.TempDir())
+	daily.Cadence = "daily"
+	daily.Hour = 10
+	daily.Minute = 30
+	daily.CreatedAt = time.Date(2026, time.July, 30, 10, 30, 0, 0, loc).UnixNano()
+	if got, want := nextScheduleRun(daily, now), time.Date(2026, time.August, 3, 10, 30, 0, 0, loc); !got.Equal(want) {
+		t.Fatalf("daily next run = %v, want %v", got, want)
+	}
+	if got, want := previousScheduleRun(daily, now), time.Date(2026, time.August, 2, 10, 30, 0, 0, loc); !got.Equal(want) {
+		t.Fatalf("daily previous run = %v, want %v", got, want)
+	}
+	if got, want := missedScheduleRuns(daily, now), 3; got != want {
+		t.Fatalf("daily missed runs = %d, want %d", got, want)
+	}
+
+	weekly := validTestSchedule(t.TempDir())
+	weekly.Hour = 10
+	weekly.Minute = 30
+	weekly.Weekday = 6
+	weekly.CreatedAt = time.Date(2026, time.July, 25, 10, 30, 0, 0, loc).UnixNano()
+	if got, want := nextScheduleRun(weekly, now), time.Date(2026, time.August, 8, 10, 30, 0, 0, loc); !got.Equal(want) {
+		t.Fatalf("weekly next run = %v, want %v", got, want)
+	}
+	if got, want := previousScheduleRun(weekly, now), time.Date(2026, time.August, 1, 10, 30, 0, 0, loc); !got.Equal(want) {
+		t.Fatalf("weekly previous run = %v, want %v", got, want)
+	}
+	if got, want := missedScheduleRuns(weekly, now), 1; got != want {
+		t.Fatalf("weekly missed runs = %d, want %d", got, want)
 	}
 }
 
@@ -122,6 +160,48 @@ func TestExecuteSchedulePersistsReadOnlyFindings(t *testing.T) {
 	}
 }
 
+func TestExecuteScheduleRecordsBudgetExceeded(t *testing.T) {
+	store, _ := testStore(t)
+	root := t.TempDir()
+	path := filepath.Join(root, "large.bin")
+	if err := os.WriteFile(path, bytes.Repeat([]byte("x"), 4096), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scheduleInput := validTestSchedule(root)
+	scheduleInput.MaxBytes = 1
+	schedule, err := store.saveSchedule(scheduleInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := executeSchedule(store, schedule, "scheduled", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status := job.snapshot(); status.State != "budget_exceeded" || status.BudgetExceeded == "" {
+		t.Fatalf("unexpected budget status: %+v", status)
+	}
+	summaries, err := store.scheduledScanSummaries(20)
+	if err != nil || len(summaries) != 1 || summaries[0].State != "budget_exceeded" {
+		t.Fatalf("budget state was not persisted: %+v, %v", summaries, err)
+	}
+	state, err := (&server{store: store}).scheduleState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	budgetAlert := false
+	for _, alert := range state.Alerts {
+		if alert.Kind == "budget" && alert.ScheduleID == schedule.ID {
+			budgetAlert = true
+		}
+	}
+	if !budgetAlert {
+		t.Fatalf("budget exhaustion was not surfaced as a schedule alert: %+v", state.Alerts)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("scheduled budget scan modified source file: %v", err)
+	}
+}
+
 type fakeScheduleBackend struct {
 	installed []string
 	removed   []string
@@ -140,6 +220,21 @@ func (f *fakeScheduleBackend) Remove(id string) error {
 
 func (*fakeScheduleBackend) Name() string {
 	return "测试调度器"
+}
+
+type inspectingScheduleBackend struct {
+	fakeScheduleBackend
+	inspection scheduleInspection
+}
+
+func (f *inspectingScheduleBackend) Install(schedule ScanSchedule, executable, dataDir string) error {
+	f.fakeScheduleBackend.installed = append(f.fakeScheduleBackend.installed, schedule.ID)
+	f.inspection = scheduleInspection{State: "ok"}
+	return f.fakeScheduleBackend.err
+}
+
+func (f *inspectingScheduleBackend) Inspect(ScanSchedule, string, string) (scheduleInspection, error) {
+	return f.inspection, nil
 }
 
 func TestScheduleHandlersExposeRegistrationFailure(t *testing.T) {
@@ -166,6 +261,86 @@ func TestScheduleHandlersExposeRegistrationFailure(t *testing.T) {
 	if len(state.Schedules) != 1 || state.Schedules[0].BackendState != "error" ||
 		state.Schedules[0].BackendError == "" || len(backend.installed) != 1 {
 		t.Fatalf("registration failure was hidden: %+v", state)
+	}
+}
+
+func TestScheduleStateExposesFailureMissedAndDriftAlerts(t *testing.T) {
+	store, _ := testStore(t)
+	root := t.TempDir()
+	schedule := validTestSchedule(root)
+	now := time.Now()
+	due := now.Add(-time.Hour)
+	schedule.CreatedAt = now.Add(-48 * time.Hour).UnixNano()
+	schedule.Hour = due.Hour()
+	schedule.Minute = due.Minute()
+	schedule.Weekday = int(due.Weekday())
+	schedule, err := store.saveSchedule(schedule)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(
+		"UPDATE scan_schedules SET created_at = ?, updated_at = ? WHERE id = ?",
+		now.Add(-48*time.Hour).UnixNano(), now.Add(-48*time.Hour).UnixNano(), schedule.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(
+		`INSERT INTO scan_sessions(
+			id, root, state, started_at, completed_at, schedule_id, trigger,
+			policy_id, policy_version, message)
+			VALUES('failed-run', ?, 'failed', ?, ?, ?, 'scheduled', 'balanced', 1, '磁盘不可用')`,
+		root, due.UnixNano(), now.UnixNano(), schedule.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	backend := &inspectingScheduleBackend{inspection: scheduleInspection{
+		State: "drifted", Message: "系统任务参数已被修改",
+	}}
+	app := &server{store: store, backend: backend}
+	result := httptest.NewRecorder()
+	app.schedules(result, httptest.NewRequest(http.MethodGet, "/api/schedules", nil))
+	if result.Code != http.StatusOK {
+		t.Fatalf("list got %d: %s", result.Code, result.Body.String())
+	}
+	var state scheduleState
+	if err := json.NewDecoder(result.Body).Decode(&state); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Schedules) != 1 || state.Schedules[0].LastRunState != "failed" ||
+		state.Schedules[0].DriftState != "drifted" || state.Schedules[0].MissedRuns == 0 {
+		t.Fatalf("schedule health was not exposed: %+v", state.Schedules)
+	}
+	if len(state.Alerts) < 3 {
+		t.Fatalf("expected failure, missed and drift alerts: %+v", state.Alerts)
+	}
+}
+
+func TestRepairScheduleReconcilesBackend(t *testing.T) {
+	store, _ := testStore(t)
+	schedule, err := store.saveSchedule(validTestSchedule(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &inspectingScheduleBackend{inspection: scheduleInspection{
+		State: "missing", Message: "系统任务不存在",
+	}}
+	app := &server{
+		store: store, backend: backend, executable: "/tmp/SpaceSheriff", dataDir: t.TempDir(),
+	}
+	result := httptest.NewRecorder()
+	app.repairSchedule(
+		result,
+		httptest.NewRequest(http.MethodPost, "/api/schedules/repair", bytes.NewBufferString(`{"id":"`+schedule.ID+`"}`)),
+	)
+	if result.Code != http.StatusOK || len(backend.installed) != 1 {
+		t.Fatalf("repair got %d, backend=%+v: %s", result.Code, backend, result.Body.String())
+	}
+	var state scheduleState
+	if err := json.NewDecoder(result.Body).Decode(&state); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Schedules) != 1 || state.Schedules[0].DriftState != "ok" {
+		t.Fatalf("repair did not clear drift: %+v", state.Schedules)
 	}
 }
 

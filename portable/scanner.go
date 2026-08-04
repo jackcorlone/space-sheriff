@@ -3,6 +3,7 @@ package main
 import (
 	"container/heap"
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -45,23 +46,35 @@ type DuplicateGroup struct {
 	Files       []FileRecord `json:"files"`
 }
 
+type ScanErrorSample struct {
+	Category string `json:"category"`
+	Path     string `json:"path,omitempty"`
+	Message  string `json:"message"`
+}
+
 type ScanStatus struct {
-	State           string           `json:"state"`
-	Phase           string           `json:"phase"`
-	Root            string           `json:"root"`
-	PolicyID        string           `json:"policyId,omitempty"`
-	PolicyVersion   int              `json:"policyVersion,omitempty"`
-	FilesSeen       int64            `json:"filesSeen"`
-	FilesHashed     int64            `json:"filesHashed"`
-	HashesReused    int64            `json:"hashesReused"`
-	BytesSeen       int64            `json:"bytesSeen"`
-	Errors          int64            `json:"errors"`
-	Excluded        int64            `json:"excluded"`
-	CurrentPath     string           `json:"currentPath"`
-	ElapsedMS       int64            `json:"elapsedMs"`
-	Results         []FileRecord     `json:"results,omitempty"`
-	DuplicateGroups []DuplicateGroup `json:"duplicateGroups,omitempty"`
-	Message         string           `json:"message,omitempty"`
+	State              string            `json:"state"`
+	Phase              string            `json:"phase"`
+	Root               string            `json:"root"`
+	PolicyID           string            `json:"policyId,omitempty"`
+	PolicyVersion      int               `json:"policyVersion,omitempty"`
+	FilesSeen          int64             `json:"filesSeen"`
+	FilesHashed        int64             `json:"filesHashed"`
+	HashesReused       int64             `json:"hashesReused"`
+	FilesFingerprinted int64             `json:"filesFingerprinted,omitempty"`
+	BytesSeen          int64             `json:"bytesSeen"`
+	Errors             int64             `json:"errors"`
+	ErrorCounts        map[string]int64  `json:"errorCounts,omitempty"`
+	ErrorSamples       []ScanErrorSample `json:"errorSamples,omitempty"`
+	Excluded           int64             `json:"excluded"`
+	CurrentPath        string            `json:"currentPath"`
+	ElapsedMS          int64             `json:"elapsedMs"`
+	BudgetBytes        int64             `json:"budgetBytes,omitempty"`
+	BudgetDurationMS   int64             `json:"budgetDurationMs,omitempty"`
+	BudgetExceeded     string            `json:"budgetExceeded,omitempty"`
+	Results            []FileRecord      `json:"results,omitempty"`
+	DuplicateGroups    []DuplicateGroup  `json:"duplicateGroups,omitempty"`
+	Message            string            `json:"message,omitempty"`
 }
 
 type scanJob struct {
@@ -74,6 +87,7 @@ type scanJob struct {
 	duplicateByPath map[string]string
 	store           *Store
 	sessionID       string
+	done            chan struct{}
 }
 
 func (j *scanJob) snapshot() ScanStatus {
@@ -82,10 +96,52 @@ func (j *scanJob) snapshot() ScanStatus {
 	out := j.status
 	out.Results = append([]FileRecord(nil), j.status.Results...)
 	out.DuplicateGroups = cloneDuplicateGroups(j.status.DuplicateGroups)
+	if len(j.status.ErrorCounts) > 0 {
+		out.ErrorCounts = make(map[string]int64, len(j.status.ErrorCounts))
+		for category, count := range j.status.ErrorCounts {
+			out.ErrorCounts[category] = count
+		}
+	}
+	out.ErrorSamples = append([]ScanErrorSample(nil), j.status.ErrorSamples...)
 	if j.status.State == "running" {
 		out.ElapsedMS = time.Since(j.started).Milliseconds()
 	}
 	return out
+}
+
+const maxScanErrorSamples = 20
+
+func truncateScanText(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	runes := []rune(value)
+	if len(runes) <= limit {
+		return value
+	}
+	return string(runes[:limit]) + "…"
+}
+
+func (j *scanJob) noteError(category, path string, err error) {
+	if category == "" {
+		category = "unknown"
+	}
+	message := "未知错误"
+	if err != nil {
+		message = err.Error()
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.status.Errors++
+	if j.status.ErrorCounts == nil {
+		j.status.ErrorCounts = make(map[string]int64)
+	}
+	j.status.ErrorCounts[category]++
+	if len(j.status.ErrorSamples) < maxScanErrorSamples {
+		j.status.ErrorSamples = append(j.status.ErrorSamples, ScanErrorSample{
+			Category: truncateScanText(category, 48),
+			Path:     truncateScanText(path, 240),
+			Message:  truncateScanText(message, 240),
+		})
+	}
 }
 
 type recordHeap []FileRecord
@@ -114,6 +170,60 @@ type ScanOptions struct {
 	Limit            int
 	Excludes         []string
 	Policy           Policy
+	MaxBytes         int64
+	MaxDuration      time.Duration
+}
+
+var errScanBudgetExceeded = errors.New("扫描达到资源预算")
+
+const maxScanDuration = 7 * 24 * time.Hour
+const maxScanBytes = int64(1) << 60
+
+func validateScanBudget(maxBytes, maxDurationSeconds int64) error {
+	if maxBytes < 0 || maxBytes > maxScanBytes {
+		return fmt.Errorf("扫描字节预算必须在 0 到 %d 之间", maxScanBytes)
+	}
+	if maxDurationSeconds < 0 || maxDurationSeconds > int64(maxScanDuration/time.Second) {
+		return fmt.Errorf("扫描时间预算必须在 0 到 %d 秒之间", int64(maxScanDuration/time.Second))
+	}
+	return nil
+}
+
+func (j *scanJob) budgetError(options ScanOptions) error {
+	j.mu.RLock()
+	bytesSeen := j.status.BytesSeen
+	j.mu.RUnlock()
+	if options.MaxBytes > 0 && bytesSeen >= options.MaxBytes {
+		err := fmt.Errorf("%w：已读取 %d 字节，预算为 %d 字节", errScanBudgetExceeded, bytesSeen, options.MaxBytes)
+		j.mu.Lock()
+		if j.status.BudgetExceeded == "" {
+			j.status.BudgetExceeded = err.Error()
+		}
+		j.mu.Unlock()
+		return err
+	}
+	if options.MaxDuration > 0 && time.Since(j.started) >= options.MaxDuration {
+		err := fmt.Errorf("%w：已运行 %s，预算为 %s", errScanBudgetExceeded,
+			time.Since(j.started).Round(time.Millisecond), options.MaxDuration)
+		j.mu.Lock()
+		if j.status.BudgetExceeded == "" {
+			j.status.BudgetExceeded = err.Error()
+		}
+		j.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+func (j *scanJob) durationBudgetError(options ScanOptions) error {
+	err := fmt.Errorf("%w：已运行 %s，预算为 %s", errScanBudgetExceeded,
+		time.Since(j.started).Round(time.Millisecond), options.MaxDuration)
+	j.mu.Lock()
+	if j.status.BudgetExceeded == "" {
+		j.status.BudgetExceeded = err.Error()
+	}
+	j.mu.Unlock()
+	return err
 }
 
 func normalizeScanRoot(path string) (string, error) {
@@ -136,28 +246,48 @@ func normalizeScanRoot(path string) (string, error) {
 }
 
 func (j *scanJob) run(ctx context.Context, root string, options ScanOptions) {
+	if j.done != nil {
+		defer close(j.done)
+	}
 	if options.Policy.ID == "" {
 		options.Policy = balancedPolicy()
+	}
+	j.mu.Lock()
+	j.status.BudgetBytes = options.MaxBytes
+	if options.MaxDuration > 0 {
+		j.status.BudgetDurationMS = options.MaxDuration.Milliseconds()
+	}
+	j.mu.Unlock()
+	scanCtx := ctx
+	var budgetCancel context.CancelFunc
+	if options.MaxDuration > 0 {
+		scanCtx, budgetCancel = context.WithTimeout(ctx, options.MaxDuration)
+		defer budgetCancel()
 	}
 	found := &recordHeap{}
 	heap.Init(found)
 	now := time.Now()
 	direct := map[string]*folderAggregate{root: {}}
-	duplicateCandidates := make([]FileRecord, 0)
+	var duplicateCandidates []FileRecord
+	if j.store == nil {
+		duplicateCandidates = make([]FileRecord, 0)
+	}
 	duplicateIdentities := make(map[string]bool)
 	indexBatch := make([]FileRecord, 0, 256)
 	excludes := newExcludeMatcher(root, options.Excludes)
+	var storageErr error
 
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if budgetErr := j.budgetError(options); budgetErr != nil {
+			return budgetErr
+		}
 		select {
-		case <-ctx.Done():
-			return context.Canceled
+		case <-scanCtx.Done():
+			return scanCtx.Err()
 		default:
 		}
 		if walkErr != nil {
-			j.mu.Lock()
-			j.status.Errors++
-			j.mu.Unlock()
+			j.noteError("walk", path, walkErr)
 			if entry != nil && entry.IsDir() {
 				return fs.SkipDir
 			}
@@ -190,9 +320,7 @@ func (j *scanJob) run(ctx context.Context, root string, options ScanOptions) {
 		info, statErr := entry.Info()
 		if statErr != nil || !info.Mode().IsRegular() {
 			if statErr != nil {
-				j.mu.Lock()
-				j.status.Errors++
-				j.mu.Unlock()
+				j.noteError("metadata", path, statErr)
 			}
 			return nil
 		}
@@ -202,6 +330,9 @@ func (j *scanJob) run(ctx context.Context, root string, options ScanOptions) {
 		j.status.BytesSeen += info.Size()
 		filesSeen := j.status.FilesSeen
 		j.mu.Unlock()
+		if budgetErr := j.budgetError(options); budgetErr != nil {
+			return budgetErr
+		}
 
 		directory := filepath.Dir(path)
 		aggregate := direct[directory]
@@ -231,17 +362,21 @@ func (j *scanJob) run(ctx context.Context, root string, options ScanOptions) {
 		if j.store != nil {
 			indexBatch = append(indexBatch, record)
 			if len(indexBatch) == cap(indexBatch) {
-				if saveErr := j.store.saveFiles(indexBatch, j.sessionID); saveErr != nil {
-					j.mu.Lock()
-					j.status.Errors++
-					j.mu.Unlock()
+				if saveErr := j.store.saveFilesContext(scanCtx, indexBatch, j.sessionID); saveErr != nil {
+					if storageErr == nil {
+						storageErr = saveErr
+					}
+					j.noteError("index", "", saveErr)
+					if errors.Is(saveErr, context.Canceled) {
+						return saveErr
+					}
 				}
 				indexBatch = indexBatch[:0]
 			}
 		}
 		if info.Size() >= options.Minimum || info.Size() >= options.DuplicateMinimum {
 			record.Advice = adviseWithPolicy(options.Policy, path, info.Size(), info.ModTime(), now)
-			if info.Size() >= options.DuplicateMinimum && !duplicateIdentities[identity] {
+			if j.store == nil && info.Size() >= options.DuplicateMinimum && !duplicateIdentities[identity] {
 				duplicateCandidates = append(duplicateCandidates, record)
 				duplicateIdentities[identity] = true
 			}
@@ -262,11 +397,22 @@ func (j *scanJob) run(ctx context.Context, root string, options ScanOptions) {
 		return nil
 	})
 	if j.store != nil && len(indexBatch) > 0 {
-		if saveErr := j.store.saveFiles(indexBatch, j.sessionID); saveErr != nil {
-			j.mu.Lock()
-			j.status.Errors++
-			j.mu.Unlock()
+		if saveErr := j.store.saveFilesContext(scanCtx, indexBatch, j.sessionID); saveErr != nil {
+			if storageErr == nil {
+				storageErr = saveErr
+			}
+			j.noteError("index", "", saveErr)
+			if errors.Is(saveErr, context.Canceled) {
+				err = saveErr
+			}
 		}
+	}
+	if options.MaxDuration > 0 &&
+		(errors.Is(err, context.DeadlineExceeded) || errors.Is(storageErr, context.DeadlineExceeded)) {
+		err = j.durationBudgetError(options)
+	}
+	if err == nil && storageErr != nil {
+		err = fmt.Errorf("保存扫描索引失败：%w", storageErr)
 	}
 
 	results := sortedRecords(*found)
@@ -280,7 +426,16 @@ func (j *scanJob) run(ctx context.Context, root string, options ScanOptions) {
 		if j.store != nil {
 			_ = j.store.setScanState(j.sessionID, "hashing")
 		}
-		duplicateGroups, duplicateByPath, err = j.findDuplicates(ctx, duplicateCandidates)
+		if j.store != nil {
+			duplicateGroups, duplicateByPath, err = j.findStoredDuplicates(
+				scanCtx, options.DuplicateMinimum, options.Policy, now,
+			)
+		} else {
+			duplicateGroups, duplicateByPath, err = j.findDuplicates(scanCtx, duplicateCandidates)
+		}
+		if options.MaxDuration > 0 && errors.Is(err, context.DeadlineExceeded) {
+			err = j.durationBudgetError(options)
+		}
 	}
 	paths := make([]string, 0, len(direct))
 	for path := range direct {
@@ -341,8 +496,11 @@ func (j *scanJob) run(ctx context.Context, root string, options ScanOptions) {
 		}
 	}
 	switch {
-	case err == context.Canceled:
+	case errors.Is(err, context.Canceled):
 		j.status.State = "cancelled"
+	case errors.Is(err, errScanBudgetExceeded):
+		j.status.State = "budget_exceeded"
+		j.status.Message = err.Error()
 	case err != nil:
 		j.status.State = "error"
 		j.status.Message = err.Error()
@@ -354,9 +512,10 @@ func (j *scanJob) run(ctx context.Context, root string, options ScanOptions) {
 	j.mu.Unlock()
 	if j.store != nil {
 		state := map[string]string{
-			"done":      "completed",
-			"cancelled": "cancelled",
-			"error":     "failed",
+			"done":            "completed",
+			"cancelled":       "cancelled",
+			"budget_exceeded": "budget_exceeded",
+			"error":           "failed",
 		}[finalStatus.State]
 		if finishErr := j.store.finishScan(
 			j.sessionID, state, finalStatus.Message, finalStatus,

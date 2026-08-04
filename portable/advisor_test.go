@@ -16,6 +16,14 @@ func TestAdviceProtectsSystemFile(t *testing.T) {
 	}
 }
 
+func TestAdviceProtectsSystemInstaller(t *testing.T) {
+	now := time.Now()
+	got := advise(`/System/Library/AssetsV2/com_apple_MobileAsset/example.dmg`, 100, now.Add(-90*24*time.Hour), now)
+	if got.Level != "danger" || got.RuleID != "SYSTEM_PROTECTED" {
+		t.Fatalf("unexpected advice: %+v", got)
+	}
+}
+
 func TestAdviceAllowsOldCache(t *testing.T) {
 	now := time.Now()
 	got := advise(`/Users/me/Library/Caches/app/data.bin`, 100, now.Add(-40*24*time.Hour), now)

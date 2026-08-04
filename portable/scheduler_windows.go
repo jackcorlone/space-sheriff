@@ -73,15 +73,45 @@ func (platformScheduleBackend) Remove(id string) error {
 	output, err := exec.Command(
 		"schtasks.exe", "/Delete", "/TN", "SpaceSheriff-"+id, "/F",
 	).CombinedOutput()
-	lower := strings.ToLower(string(output))
-	missing := strings.Contains(lower, "cannot find") ||
-		strings.Contains(lower, "not found") ||
-		strings.Contains(lower, "not exist") ||
-		strings.Contains(string(output), "找不到")
-	if err != nil && !missing {
+	if err != nil && !windowsTaskMissing(string(output)) {
 		return fmt.Errorf("schtasks delete: %s", string(output))
 	}
 	return nil
+}
+
+func windowsTaskMissing(output string) bool {
+	lower := strings.ToLower(output)
+	return strings.Contains(lower, "cannot find") ||
+		strings.Contains(lower, "not found") ||
+		strings.Contains(lower, "not exist") ||
+		strings.Contains(output, "找不到")
+}
+
+func (platformScheduleBackend) Inspect(schedule ScanSchedule, executable, dataDir string) (scheduleInspection, error) {
+	output, err := exec.Command(
+		"schtasks.exe", "/Query", "/TN", "SpaceSheriff-"+schedule.ID, "/XML",
+	).CombinedOutput()
+	if err != nil {
+		if windowsTaskMissing(string(output)) {
+			if schedule.Enabled {
+				return scheduleInspection{State: "missing", Message: "Windows 计划任务不存在"}, nil
+			}
+			return scheduleInspection{State: "ok"}, nil
+		}
+		return scheduleInspection{State: "unknown"}, fmt.Errorf("schtasks query: %s", string(output))
+	}
+	if !schedule.Enabled {
+		return scheduleInspection{State: "drifted", Message: "停用计划仍保留 Windows 计划任务"}, nil
+	}
+	normalized := strings.ToLower(strings.ReplaceAll(string(output), "\x00", ""))
+	for _, value := range []string{
+		strings.ToLower(executable), strings.ToLower(dataDir), strings.ToLower(schedule.ID),
+	} {
+		if value != "" && !strings.Contains(normalized, value) {
+			return scheduleInspection{State: "drifted", Message: "Windows 计划任务参数已被修改"}, nil
+		}
+	}
+	return scheduleInspection{State: "ok"}, nil
 }
 
 func (platformScheduleBackend) Name() string {

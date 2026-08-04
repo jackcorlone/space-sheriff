@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -11,7 +12,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 3
+const schemaVersion = 4
 const scanSessionRetention = 90 * 24 * time.Hour
 
 type Store struct {
@@ -103,6 +104,10 @@ func (s *Store) migrate() error {
 			}
 		case 2:
 			if err := s.migrateV3(); err != nil {
+				return err
+			}
+		case 3:
+			if err := s.migrateV4(); err != nil {
 				return err
 			}
 		default:
@@ -289,6 +294,23 @@ CREATE INDEX scan_sessions_schedule_time_index
 	return tx.Commit()
 }
 
+func (s *Store) migrateV4() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`
+ALTER TABLE scan_schedules ADD COLUMN max_bytes INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE scan_schedules ADD COLUMN max_duration_seconds INTEGER NOT NULL DEFAULT 0;`); err != nil {
+		return fmt.Errorf("迁移数据库到 v4: %w", err)
+	}
+	if _, err := tx.Exec("PRAGMA user_version = 4"); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) recoverInterrupted() error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -298,8 +320,14 @@ func (s *Store) recoverInterrupted() error {
 	now := time.Now().UnixNano()
 	if _, err := tx.Exec(
 		`UPDATE scan_sessions SET state = 'failed', completed_at = ?, message = '上次进程中断'
-		 WHERE state IN ('walking', 'hashing') AND started_at < ?`,
-		now, time.Now().Add(-scheduleLeaseTTL).UnixNano(),
+			 WHERE state IN ('walking', 'hashing') AND started_at < ?
+			   AND NOT EXISTS (
+					SELECT 1 FROM schedule_leases sl
+					 WHERE sl.schedule_id = scan_sessions.schedule_id
+					   AND scan_sessions.schedule_id <> ''
+					   AND sl.acquired_at >= ?
+				)`,
+		now, time.Now().Add(-scheduleLeaseTTL).UnixNano(), time.Now().Add(-scheduleLeaseTTL).UnixNano(),
 	); err != nil {
 		return err
 	}
@@ -402,21 +430,90 @@ func (s *Store) cachedHash(record FileRecord) (string, bool, error) {
 	return hash, err == nil, err
 }
 
+func (s *Store) duplicateSizes(ctx context.Context, sessionID string, minimum int64) ([]int64, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT size FROM files
+		 WHERE last_seen_session = ? AND size >= ?
+		 GROUP BY size HAVING COUNT(*) > 1 ORDER BY size`, sessionID, minimum,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	sizes := make([]int64, 0)
+	for rows.Next() {
+		var size int64
+		if err := rows.Scan(&size); err != nil {
+			return nil, err
+		}
+		sizes = append(sizes, size)
+	}
+	return sizes, rows.Err()
+}
+
+func (s *Store) filesBySize(ctx context.Context, sessionID string, size int64) ([]FileRecord, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT identity, path, size, modified_at, physical_size, link_count
+		 FROM files WHERE last_seen_session = ? AND size = ? ORDER BY path`, sessionID, size,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	records := make([]FileRecord, 0)
+	for rows.Next() {
+		var record FileRecord
+		if err := rows.Scan(
+			&record.Identity, &record.Path, &record.Size, &record.ModifiedUnixNano,
+			&record.PhysicalSize, &record.LinkCount,
+		); err != nil {
+			return nil, err
+		}
+		record.ModifiedAt = time.Unix(0, record.ModifiedUnixNano).Format("2006-01-02 15:04")
+		records = append(records, record)
+	}
+	return records, rows.Err()
+}
+
 func (s *Store) saveFile(record FileRecord, hash, sessionID string) error {
-	return s.saveFilesWithHash([]FileRecord{record}, hash, sessionID)
+	return s.saveFileHashes(context.Background(), []fileHashRecord{{record: record, hash: hash}}, sessionID)
 }
 
 func (s *Store) saveFiles(records []FileRecord, sessionID string) error {
-	return s.saveFilesWithHash(records, "", sessionID)
+	return s.saveFilesContext(context.Background(), records, sessionID)
 }
 
 func (s *Store) saveFilesWithHash(records []FileRecord, hash, sessionID string) error {
-	tx, err := s.db.Begin()
+	hashed := make([]fileHashRecord, 0, len(records))
+	for _, record := range records {
+		hashed = append(hashed, fileHashRecord{record: record, hash: hash})
+	}
+	return s.saveFileHashes(context.Background(), hashed, sessionID)
+}
+
+func (s *Store) saveFilesContext(ctx context.Context, records []FileRecord, sessionID string) error {
+	hashed := make([]fileHashRecord, 0, len(records))
+	for _, record := range records {
+		hashed = append(hashed, fileHashRecord{record: record})
+	}
+	return s.saveFileHashes(ctx, hashed, sessionID)
+}
+
+type fileHashRecord struct {
+	record FileRecord
+	hash   string
+}
+
+func (s *Store) saveFileHashes(ctx context.Context, records []fileHashRecord, sessionID string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	statement, err := tx.Prepare(
+	statement, err := tx.PrepareContext(ctx,
 		`INSERT INTO files(identity, path, size, modified_at, physical_size, link_count,
 		 sha256, hash_updated_at, last_seen_session)
 		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -442,17 +539,21 @@ func (s *Store) saveFilesWithHash(records []FileRecord, hash, sessionID string) 
 		return err
 	}
 	defer statement.Close()
-	for _, record := range records {
+	for _, item := range records {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		record := item.record
 		if record.Identity == "" {
 			continue
 		}
 		var hashUpdated any
-		if hash != "" {
+		if item.hash != "" {
 			hashUpdated = time.Now().UnixNano()
 		}
-		if _, err := statement.Exec(
+		if _, err := statement.ExecContext(ctx,
 			record.Identity, record.Path, record.Size, record.ModifiedUnixNano,
-			record.PhysicalSize, record.LinkCount, hash, hashUpdated, sessionID,
+			record.PhysicalSize, record.LinkCount, item.hash, hashUpdated, sessionID,
 		); err != nil {
 			return err
 		}

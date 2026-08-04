@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
@@ -24,6 +25,25 @@ func TestScannerFiltersSortsAndLimits(t *testing.T) {
 	}
 	if status.Results[0].Size != 20 || status.Results[1].Size != 10 {
 		t.Fatalf("results not sorted: %+v", status.Results)
+	}
+}
+
+func TestScanErrorDiagnosticsAreCategorizedAndBounded(t *testing.T) {
+	job := &scanJob{}
+	for index := 0; index < maxScanErrorSamples+3; index++ {
+		job.noteError("metadata", "/tmp/example", os.ErrPermission)
+	}
+	status := job.snapshot()
+	if status.Errors != int64(maxScanErrorSamples+3) || status.ErrorCounts["metadata"] != int64(maxScanErrorSamples+3) {
+		t.Fatalf("unexpected error counters: %+v", status)
+	}
+	if len(status.ErrorSamples) != maxScanErrorSamples {
+		t.Fatalf("sample limit = %d, want %d", len(status.ErrorSamples), maxScanErrorSamples)
+	}
+	status.ErrorCounts["metadata"] = 0
+	status.ErrorSamples[0].Message = "changed"
+	if job.snapshot().ErrorCounts["metadata"] != int64(maxScanErrorSamples+3) || job.snapshot().ErrorSamples[0].Message == "changed" {
+		t.Fatal("snapshot exposed mutable diagnostic state")
 	}
 }
 
@@ -263,5 +283,62 @@ func TestScannerReusesHashesOnSecondScan(t *testing.T) {
 	}
 	if second.FilesHashed != 0 || second.HashesReused != 2 {
 		t.Fatalf("unexpected second scan cache stats: %+v", second)
+	}
+}
+
+func TestScannerStopsWhenByteBudgetIsReached(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"a.bin", "b.bin"} {
+		if err := os.WriteFile(filepath.Join(root, name), make([]byte, 4), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	job := &scanJob{
+		status:  ScanStatus{State: "running", Root: root},
+		started: time.Now(), known: make(map[string]FileRecord),
+		folders: make(map[string]FolderRecord),
+	}
+	job.run(context.Background(), root, ScanOptions{
+		Minimum: 0, DuplicateMinimum: 1 << 60, Limit: 10, MaxBytes: 5,
+	})
+	status := job.snapshot()
+	if status.State != "budget_exceeded" || status.BudgetExceeded == "" {
+		t.Fatalf("unexpected budget status: %+v", status)
+	}
+	if status.BytesSeen < 5 {
+		t.Fatalf("budget did not account for scanned bytes: %+v", status)
+	}
+}
+
+func TestStoredDuplicateScanUsesQuickFingerprintBeforeFullHash(t *testing.T) {
+	root := t.TempDir()
+	first := bytes.Repeat([]byte("a"), 2*quickFingerprintChunkSize)
+	second := bytes.Repeat([]byte("a"), 2*quickFingerprintChunkSize)
+	second[0] = 'b'
+	if err := os.WriteFile(filepath.Join(root, "one.bin"), first, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "two.bin"), second, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, _ := testStore(t)
+	sessionID, err := store.beginScan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := &scanJob{
+		status: ScanStatus{State: "running", Root: root}, started: time.Now(),
+		known: make(map[string]FileRecord), folders: make(map[string]FolderRecord),
+		duplicateByPath: make(map[string]string), store: store, sessionID: sessionID,
+	}
+	job.run(context.Background(), root, ScanOptions{
+		Minimum: 0, DuplicateMinimum: 1, Limit: 10,
+	})
+	status := job.snapshot()
+	if status.State != "done" || status.FilesFingerprinted != 2 || status.FilesHashed != 0 {
+		t.Fatalf("quick fingerprint did not filter candidates: %+v", status)
+	}
+	if len(status.DuplicateGroups) != 0 {
+		t.Fatalf("different content was reported as duplicate: %+v", status.DuplicateGroups)
 	}
 }

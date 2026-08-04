@@ -24,3 +24,18 @@ func TestWindowsScheduleArgumentsQuotePathsAndWeekday(t *testing.T) {
 		t.Fatalf("paths were not quoted: %s", taskCommand)
 	}
 }
+
+func TestWindowsTaskMissingMessages(t *testing.T) {
+	for _, message := range []string{
+		"ERROR: The system cannot find the file specified.",
+		"Task does not exist",
+		"找不到指定的任务",
+	} {
+		if !windowsTaskMissing(message) {
+			t.Fatalf("missing task message not recognized: %q", message)
+		}
+	}
+	if windowsTaskMissing("Access is denied") {
+		t.Fatal("permission error was treated as a missing task")
+	}
+}

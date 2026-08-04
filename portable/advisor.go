@@ -57,6 +57,22 @@ func intersects(parts, candidates map[string]bool) bool {
 	return false
 }
 
+func isProtectedSystemPath(path string) bool {
+	parts := pathParts(path)
+	if intersects(parts, coreSystemParts) {
+		return true
+	}
+	for part := range protectedParts {
+		if part == "library" && parts["users"] && intersects(parts, cacheParts) {
+			continue
+		}
+		if parts[part] {
+			return true
+		}
+	}
+	return false
+}
+
 func advise(path string, size int64, modified, now time.Time) Advice {
 	return adviseWithPolicy(balancedPolicy(), path, size, modified, now)
 }
@@ -71,6 +87,9 @@ func adviseWithPolicy(policy Policy, path string, size int64, modified, now time
 
 	if intersects(parts, coreSystemParts) {
 		return Advice{"danger", "不建议删除", "位于核心系统目录，删除可能导致系统或软件无法运行。", 0, "SYSTEM_CORE", "系统文件"}
+	}
+	if isProtectedSystemPath(path) {
+		return Advice{"danger", "不建议删除", "位于系统或应用目录，删除可能导致系统或软件无法运行。", 0, "SYSTEM_PROTECTED", "系统文件"}
 	}
 	if installerExts[ext] && age >= policy.InstallerMinAgeDays {
 		return Advice{
@@ -101,9 +120,6 @@ func adviseWithPolicy(policy Policy, path string, size int64, modified, now time
 			}
 		}
 		return Advice{"review", "需人工确认", "位于缓存、临时或日志目录，但文件仅 " + dayText(age) + " 未修改，可能仍在使用。", 45, "CACHE_RECENT", "缓存与日志"}
-	}
-	if intersects(parts, protectedParts) {
-		return Advice{"danger", "不建议删除", "位于系统或应用目录，删除可能导致系统或软件无法运行。", 0, "SYSTEM_PROTECTED", "系统文件"}
 	}
 	if archiveExts[ext] && age >= policy.ArchiveMinAgeDays {
 		return Advice{"review", "可考虑清理", "这是压缩包，已 " + dayText(age) + " 未修改；请确认内容已有副本或已解压。", 60, "ARCHIVE_OLD", "压缩包"}

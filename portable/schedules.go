@@ -15,23 +15,31 @@ const scheduleLeaseTTL = 6 * time.Hour
 var errScheduleBusy = errors.New("该计划已有扫描正在运行")
 
 type ScanSchedule struct {
-	ID               string   `json:"id"`
-	Name             string   `json:"name"`
-	Root             string   `json:"root"`
-	Cadence          string   `json:"cadence"`
-	Hour             int      `json:"hour"`
-	Minute           int      `json:"minute"`
-	Weekday          int      `json:"weekday"`
-	Minimum          int64    `json:"minimum"`
-	DuplicateMinimum int64    `json:"duplicateMinimum"`
-	ResultLimit      int      `json:"resultLimit"`
-	Excludes         []string `json:"excludes"`
-	Enabled          bool     `json:"enabled"`
-	BackendState     string   `json:"backendState"`
-	BackendError     string   `json:"backendError,omitempty"`
-	CreatedAt        int64    `json:"createdAt"`
-	UpdatedAt        int64    `json:"updatedAt"`
-	LastRunAt        int64    `json:"lastRunAt,omitempty"`
+	ID                 string   `json:"id"`
+	Name               string   `json:"name"`
+	Root               string   `json:"root"`
+	Cadence            string   `json:"cadence"`
+	Hour               int      `json:"hour"`
+	Minute             int      `json:"minute"`
+	Weekday            int      `json:"weekday"`
+	Minimum            int64    `json:"minimum"`
+	DuplicateMinimum   int64    `json:"duplicateMinimum"`
+	ResultLimit        int      `json:"resultLimit"`
+	MaxBytes           int64    `json:"maxBytes,omitempty"`
+	MaxDurationSeconds int64    `json:"maxDurationSeconds,omitempty"`
+	Excludes           []string `json:"excludes"`
+	Enabled            bool     `json:"enabled"`
+	BackendState       string   `json:"backendState"`
+	BackendError       string   `json:"backendError,omitempty"`
+	CreatedAt          int64    `json:"createdAt"`
+	UpdatedAt          int64    `json:"updatedAt"`
+	LastRunAt          int64    `json:"lastRunAt,omitempty"`
+	NextRunAt          int64    `json:"nextRunAt,omitempty"`
+	MissedRuns         int      `json:"missedRuns,omitempty"`
+	LastRunState       string   `json:"lastRunState,omitempty"`
+	LastRunMessage     string   `json:"lastRunMessage,omitempty"`
+	DriftState         string   `json:"driftState,omitempty"`
+	DriftMessage       string   `json:"driftMessage,omitempty"`
 }
 
 type ScheduledScanSummary struct {
@@ -55,6 +63,23 @@ type ScheduledScanSummary struct {
 type ScheduledScanDetail struct {
 	Summary  ScheduledScanSummary `json:"summary"`
 	Findings []FileRecord         `json:"findings"`
+}
+
+type ScheduleAlert struct {
+	ScheduleID   string `json:"scheduleId"`
+	ScheduleName string `json:"scheduleName"`
+	Kind         string `json:"kind"`
+	Message      string `json:"message"`
+	OccurredAt   int64  `json:"occurredAt,omitempty"`
+}
+
+type scheduleInspection struct {
+	State   string
+	Message string
+}
+
+type scheduleInspector interface {
+	Inspect(ScanSchedule, string, string) (scheduleInspection, error)
 }
 
 type scheduleBackend interface {
@@ -91,6 +116,9 @@ func validateSchedule(schedule *ScanSchedule) error {
 	if schedule.ResultLimit < 1 || schedule.ResultLimit > 2000 {
 		return fmt.Errorf("结果上限必须在 1 到 2000 之间")
 	}
+	if err := validateScanBudget(schedule.MaxBytes, schedule.MaxDurationSeconds); err != nil {
+		return err
+	}
 	if len(schedule.Excludes) > 100 {
 		return fmt.Errorf("排除规则最多 100 条")
 	}
@@ -126,20 +154,24 @@ func (s *Store) saveSchedule(schedule ScanSchedule) (ScanSchedule, error) {
 	_, err = s.db.Exec(
 		`INSERT INTO scan_schedules(
 		 id, name, root, cadence, hour, minute, weekday, minimum_bytes,
-		 duplicate_minimum_bytes, result_limit, excludes_json, enabled,
+		 duplicate_minimum_bytes, result_limit, max_bytes, max_duration_seconds,
+		 excludes_json, enabled,
 		 backend_state, backend_error, created_at, updated_at)
-		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(id) DO UPDATE SET
 		 name=excluded.name, root=excluded.root, cadence=excluded.cadence,
 		 hour=excluded.hour, minute=excluded.minute, weekday=excluded.weekday,
 		 minimum_bytes=excluded.minimum_bytes,
 		 duplicate_minimum_bytes=excluded.duplicate_minimum_bytes,
-		 result_limit=excluded.result_limit, excludes_json=excluded.excludes_json,
+		 result_limit=excluded.result_limit, max_bytes=excluded.max_bytes,
+		 max_duration_seconds=excluded.max_duration_seconds,
+		 excludes_json=excluded.excludes_json,
 		 enabled=excluded.enabled, backend_state=excluded.backend_state,
 		 backend_error=excluded.backend_error, updated_at=excluded.updated_at`,
 		schedule.ID, schedule.Name, schedule.Root, schedule.Cadence,
 		schedule.Hour, schedule.Minute, schedule.Weekday, schedule.Minimum,
-		schedule.DuplicateMinimum, schedule.ResultLimit, string(excludes),
+		schedule.DuplicateMinimum, schedule.ResultLimit, schedule.MaxBytes,
+		schedule.MaxDurationSeconds, string(excludes),
 		schedule.Enabled, schedule.BackendState, schedule.BackendError,
 		schedule.CreatedAt, schedule.UpdatedAt,
 	)
@@ -157,7 +189,8 @@ func scanScheduleRow(row interface{ Scan(...any) error }) (ScanSchedule, error) 
 	err := row.Scan(
 		&schedule.ID, &schedule.Name, &schedule.Root, &schedule.Cadence,
 		&schedule.Hour, &schedule.Minute, &schedule.Weekday, &schedule.Minimum,
-		&schedule.DuplicateMinimum, &schedule.ResultLimit, &excludes, &enabled,
+		&schedule.DuplicateMinimum, &schedule.ResultLimit, &schedule.MaxBytes,
+		&schedule.MaxDurationSeconds, &excludes, &enabled,
 		&schedule.BackendState, &schedule.BackendError, &schedule.CreatedAt,
 		&schedule.UpdatedAt, &lastRun,
 	)
@@ -178,7 +211,8 @@ func scanScheduleRow(row interface{ Scan(...any) error }) (ScanSchedule, error) 
 }
 
 const scheduleColumns = `id, name, root, cadence, hour, minute, weekday,
-	minimum_bytes, duplicate_minimum_bytes, result_limit, excludes_json, enabled,
+	minimum_bytes, duplicate_minimum_bytes, result_limit, max_bytes,
+	max_duration_seconds, excludes_json, enabled,
 	backend_state, backend_error, created_at, updated_at, last_run_at`
 
 func (s *Store) schedule(id string) (ScanSchedule, error) {
@@ -330,6 +364,98 @@ func (s *Store) scheduledScanSummaries(limit int) ([]ScheduledScanSummary, error
 	return result, rows.Err()
 }
 
+func (s *Store) latestScheduledScan(scheduleID string) (ScheduledScanSummary, error) {
+	var item ScheduledScanSummary
+	var completed sql.NullInt64
+	err := s.db.QueryRow(
+		`SELECT ss.id, ss.schedule_id, COALESCE(sc.name, '已删除计划'), ss.root,
+			 ss.state, ss.trigger, ss.started_at, ss.completed_at, ss.files_seen,
+			 ss.bytes_seen, ss.errors,
+			 (SELECT COUNT(*) FROM scan_findings sf WHERE sf.session_id = ss.id),
+			 ss.policy_id, ss.policy_version, ss.message
+			 FROM scan_sessions ss LEFT JOIN scan_schedules sc ON sc.id = ss.schedule_id
+			 WHERE ss.schedule_id = ? AND ss.trigger IN ('scheduled', 'manual_schedule')
+			 ORDER BY ss.started_at DESC LIMIT 1`, scheduleID,
+	).Scan(
+		&item.ID, &item.ScheduleID, &item.ScheduleName, &item.Root,
+		&item.State, &item.Trigger, &item.StartedAt, &completed, &item.FilesSeen,
+		&item.BytesSeen, &item.Errors, &item.ResultCount, &item.PolicyID,
+		&item.PolicyVersion, &item.Message,
+	)
+	if err != nil {
+		return item, err
+	}
+	if completed.Valid {
+		item.CompletedAt = completed.Int64
+	}
+	return item, nil
+}
+
+func nextScheduleRun(schedule ScanSchedule, now time.Time) time.Time {
+	now = now.In(time.Local)
+	candidate := time.Date(now.Year(), now.Month(), now.Day(), schedule.Hour, schedule.Minute, 0, 0, now.Location())
+	if schedule.Cadence == "weekly" {
+		days := (schedule.Weekday - int(candidate.Weekday()) + 7) % 7
+		candidate = candidate.AddDate(0, 0, days)
+		if !candidate.After(now) {
+			candidate = candidate.AddDate(0, 0, 7)
+		}
+		return candidate
+	}
+	if !candidate.After(now) {
+		candidate = candidate.AddDate(0, 0, 1)
+	}
+	return candidate
+}
+
+func previousScheduleRun(schedule ScanSchedule, now time.Time) time.Time {
+	now = now.In(time.Local)
+	candidate := time.Date(now.Year(), now.Month(), now.Day(), schedule.Hour, schedule.Minute, 0, 0, now.Location())
+	if schedule.Cadence == "weekly" {
+		days := (int(candidate.Weekday()) - schedule.Weekday + 7) % 7
+		candidate = candidate.AddDate(0, 0, -days)
+		if candidate.After(now) {
+			candidate = candidate.AddDate(0, 0, -7)
+		}
+		return candidate
+	}
+	if candidate.After(now) {
+		candidate = candidate.AddDate(0, 0, -1)
+	}
+	return candidate
+}
+
+func missedScheduleRuns(schedule ScanSchedule, now time.Time) int {
+	if !schedule.Enabled {
+		return 0
+	}
+	baseline := schedule.CreatedAt
+	if schedule.UpdatedAt > baseline {
+		baseline = schedule.UpdatedAt
+	}
+	if schedule.LastRunAt > baseline {
+		baseline = schedule.LastRunAt
+	}
+	if baseline == 0 {
+		return 0
+	}
+	first := nextScheduleRun(schedule, time.Unix(0, baseline))
+	last := previousScheduleRun(schedule, now)
+	if first.After(last) {
+		return 0
+	}
+	count := 0
+	for due := first; !due.After(last) && count < 10000; {
+		count++
+		if schedule.Cadence == "weekly" {
+			due = due.AddDate(0, 0, 7)
+		} else {
+			due = due.AddDate(0, 0, 1)
+		}
+	}
+	return count
+}
+
 func (s *Store) scheduledScanDetail(id string) (ScheduledScanDetail, error) {
 	var detail ScheduledScanDetail
 	var completed sql.NullInt64
@@ -384,6 +510,9 @@ func executeSchedule(
 	if !schedule.Enabled && trigger == "scheduled" {
 		return nil, fmt.Errorf("计划已停用")
 	}
+	if err := validateScanBudget(schedule.MaxBytes, schedule.MaxDurationSeconds); err != nil {
+		return nil, err
+	}
 	owner, err := newID()
 	if err != nil {
 		return nil, err
@@ -408,7 +537,7 @@ func executeSchedule(
 		},
 		started: time.Now(), cancel: cancel, known: make(map[string]FileRecord),
 		folders: make(map[string]FolderRecord), duplicateByPath: make(map[string]string),
-		store: store, sessionID: sessionID,
+		store: store, sessionID: sessionID, done: make(chan struct{}),
 	}
 	heartbeatStop := make(chan struct{})
 	heartbeatStopped := make(chan struct{})
@@ -436,6 +565,8 @@ func executeSchedule(
 	job.run(ctx, schedule.Root, ScanOptions{
 		Minimum: schedule.Minimum, DuplicateMinimum: schedule.DuplicateMinimum,
 		Limit: schedule.ResultLimit, Excludes: schedule.Excludes, Policy: policy,
+		MaxBytes:    schedule.MaxBytes,
+		MaxDuration: time.Duration(schedule.MaxDurationSeconds) * time.Second,
 	})
 	close(heartbeatStop)
 	<-heartbeatStopped

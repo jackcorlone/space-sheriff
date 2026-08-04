@@ -22,6 +22,7 @@ type AuditSummary struct {
 	PolicyID      string `json:"policyId"`
 	PolicyVersion int    `json:"policyVersion"`
 	PlannedBytes  int64  `json:"plannedBytes"`
+	MovedBytes    int64  `json:"movedBytes"`
 	ReleasedBytes int64  `json:"releasedBytes"`
 	ItemCount     int64  `json:"itemCount"`
 	TrashedCount  int64  `json:"trashedCount"`
@@ -276,6 +277,7 @@ func (s *Store) auditSummaries(limit int) ([]AuditSummary, error) {
 		); err != nil {
 			return nil, err
 		}
+		summary.MovedBytes = summary.ReleasedBytes
 		summaries = append(summaries, summary)
 	}
 	return summaries, rows.Err()
@@ -294,6 +296,7 @@ func (s *Store) auditDetail(id string) (AuditDetail, error) {
 	if err != nil {
 		return AuditDetail{}, err
 	}
+	detail.MovedBytes = detail.ReleasedBytes
 	rows, err := s.db.Query(
 		`SELECT path, size, modified_at, state, error FROM cleanup_items
 		 WHERE transaction_id = ? ORDER BY path`, id,

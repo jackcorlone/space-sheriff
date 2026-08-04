@@ -7,16 +7,17 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
+  <a class="skip-link" href="#dashboard">跳到扫描概览</a>
   <header>
     <div>
-      <div class="eyebrow">SPACE SHERIFF <span id="version">v0.6</span></div>
+      <div class="eyebrow"><span class="brand-mark" data-icon="shield"></span> SPACE SHERIFF <span id="version">v1.0</span></div>
       <h1>看清空间，再安全清理。</h1>
       <p>本地扫描大文件，显示修改时间，并解释每一条删除建议。文件信息不会离开你的电脑。</p>
     </div>
-    <button id="quit" class="ghost">退出程序</button>
+    <button id="quit" class="ghost"><span class="button-icon" data-icon="power"></span>退出程序</button>
   </header>
 
-  <main>
+  <main id="mainContent">
     <section class="card controls">
       <div class="field wide">
         <label for="root">扫描位置</label>
@@ -34,8 +35,16 @@
           <option value="5368709120">5 GB</option>
         </select>
       </div>
-      <button id="scan" class="primary">开始扫描</button>
-      <button id="cancel" class="ghost" disabled>停止</button>
+      <button id="scan" class="primary"><span class="button-icon" data-icon="scan"></span>开始扫描</button>
+      <button id="cancel" class="ghost" disabled><span class="button-icon" data-icon="stop"></span>停止</button>
+    </section>
+
+    <section id="backendNotice" class="backend-notice card" role="status" aria-live="polite">
+      <span class="backend-notice-icon" data-icon="alert"></span>
+      <div>
+        <strong id="backendNoticeTitle">未连接本地分析引擎</strong>
+        <p id="backendNoticeText">正在连接本地分析引擎…</p>
+      </div>
     </section>
 
     <details class="card settings">
@@ -58,6 +67,16 @@ node_modules
 __pycache__</textarea>
           <span class="hint">可填写目录名、扫描根目录下的相对路径或绝对路径。</span>
         </div>
+        <div class="field">
+          <label for="budgetMiB">本次扫描字节上限（MiB）</label>
+          <input id="budgetMiB" type="number" min="0" step="1" value="0">
+          <span class="hint">0 表示不限制；达到上限会保留已发现结果。</span>
+        </div>
+        <div class="field">
+          <label for="budgetMinutes">本次扫描时间上限（分钟）</label>
+          <input id="budgetMinutes" type="number" min="0" max="10080" step="1" value="0">
+          <span class="hint">最长 7 天；适合慢盘或外置盘。</span>
+        </div>
       </div>
     </details>
 
@@ -65,7 +84,7 @@ __pycache__</textarea>
       <summary>定时扫描 · 只读后台报告</summary>
       <div class="schedule-grid">
         <section class="governance-panel">
-          <h3>扫描计划</h3>
+          <h3><span class="section-icon" data-icon="calendar"></span>扫描计划</h3>
           <input id="scheduleId" type="hidden">
           <div class="field">
             <label for="scheduleName">计划名称</label>
@@ -103,6 +122,17 @@ __pycache__</textarea>
           </div>
           <div class="schedule-time">
             <div class="field">
+              <label for="scheduleBudgetMiB">计划字节上限（MiB）</label>
+              <input id="scheduleBudgetMiB" type="number" min="0" step="1" value="0">
+            </div>
+            <div class="field">
+              <label for="scheduleBudgetMinutes">计划时间上限（分钟）</label>
+              <input id="scheduleBudgetMinutes" type="number" min="0" max="10080" step="1" value="0">
+            </div>
+          </div>
+          <p class="hint">预算为 0 表示不限制；达到预算的计划会记录为“预算耗尽”，不会执行清理。</p>
+          <div class="schedule-time">
+            <div class="field">
               <label for="scheduleCadence">周期</label>
               <select id="scheduleCadence">
                 <option value="weekly">每周</option>
@@ -124,17 +154,18 @@ __pycache__</textarea>
             </div>
           </div>
           <div class="governance-actions">
-            <button id="saveSchedule" class="primary">保存并启用</button>
-            <button id="resetSchedule" class="ghost">新建计划</button>
+            <button id="saveSchedule" class="primary"><span class="button-icon" data-icon="check"></span>保存并启用</button>
+            <button id="resetSchedule" class="ghost"><span class="button-icon" data-icon="plus"></span>新建计划</button>
           </div>
           <p id="scheduleBackend" class="hint">正在读取系统任务能力…</p>
           <p class="hint">后台任务只扫描、计算哈希并保存报告，绝不会移动或删除文件。</p>
+          <div id="scheduleAlerts" class="schedule-alerts hidden"></div>
         </section>
 
         <section class="schedule-list-panel">
           <div class="results-head">
             <div><h3>已保存计划</h3><span id="scheduleSummary" class="muted">正在读取…</span></div>
-            <button id="refreshSchedules" class="ghost">刷新</button>
+            <button id="refreshSchedules" class="ghost"><span class="button-icon" data-icon="refresh"></span>刷新</button>
           </div>
           <div id="scheduleCards" class="schedule-cards"></div>
         </section>
@@ -157,19 +188,19 @@ __pycache__</textarea>
       <summary>治理中心 · 策略、审计与数据库健康</summary>
       <div class="governance-grid">
         <section class="governance-panel">
-          <h3>清理判断策略</h3>
+          <h3><span class="section-icon" data-icon="shield"></span>清理判断策略</h3>
           <div class="field">
             <label for="policySelect">活动策略</label>
             <select id="policySelect"></select>
           </div>
           <p id="policyDescription" class="muted">正在读取策略…</p>
           <div id="policyThresholds" class="metric-grid"></div>
-          <button id="activatePolicy" class="primary">启用所选策略</button>
+          <button id="activatePolicy" class="primary"><span class="button-icon" data-icon="check"></span>启用所选策略</button>
           <p class="hint">策略切换只影响后续扫描，不会自动修改已有结果或执行清理。</p>
         </section>
 
         <section class="governance-panel">
-          <h3>导入自定义策略</h3>
+          <h3><span class="section-icon" data-icon="file"></span>导入自定义策略</h3>
           <textarea id="policyJson" rows="12" spellcheck="false">{
   "id": "my-policy",
   "name": "我的策略",
@@ -182,18 +213,18 @@ __pycache__</textarea>
   "largeStaleMinAgeDays": 180,
   "largeStaleMinBytes": 10737418240
 }</textarea>
-          <button id="importPolicy" class="ghost">校验并导入</button>
+          <button id="importPolicy" class="ghost"><span class="button-icon" data-icon="upload"></span>校验并导入</button>
           <p class="hint">只接受固定阈值字段；脚本、表达式和未知字段会被拒绝。</p>
         </section>
 
         <section class="governance-panel">
-          <h3>数据库健康</h3>
+          <h3><span class="section-icon" data-icon="database"></span>数据库健康</h3>
           <div id="databaseHealth" class="metric-grid">
             <span class="muted">正在检查…</span>
           </div>
           <div class="governance-actions">
-            <button id="checkpointDatabase" class="ghost">回收 WAL 空间</button>
-            <button id="optimizeDatabase" class="ghost">优化数据库</button>
+            <button id="checkpointDatabase" class="ghost"><span class="button-icon" data-icon="database"></span>回收 WAL 空间</button>
+            <button id="optimizeDatabase" class="ghost"><span class="button-icon" data-icon="spark"></span>优化数据库</button>
           </div>
           <p class="hint">维护不会删除扫描索引、计划或审计记录；扫描期间不可执行。</p>
         </section>
@@ -205,11 +236,11 @@ __pycache__</textarea>
             <h3>最近清理事务</h3>
             <span id="auditSummary" class="muted">正在读取…</span>
           </div>
-          <button id="refreshGovernance" class="ghost">刷新</button>
+          <button id="refreshGovernance" class="ghost"><span class="button-icon" data-icon="refresh"></span>刷新</button>
         </div>
         <div class="table-wrap audit-table">
           <table>
-            <thead><tr><th>时间</th><th>状态</th><th>策略</th><th>项目</th><th>计划空间</th><th>实际释放</th></tr></thead>
+            <thead><tr><th>时间</th><th>状态</th><th>策略</th><th>项目</th><th>计划空间</th><th>已移入回收站</th></tr></thead>
             <tbody id="auditRows"></tbody>
           </table>
         </div>
@@ -229,7 +260,7 @@ __pycache__</textarea>
       </div>
     </section>
 
-    <section class="card status-card">
+    <section class="card status-card" role="status" aria-live="polite">
       <div class="pulse" id="pulse"></div>
       <div>
         <strong id="status">准备就绪</strong>
@@ -237,13 +268,68 @@ __pycache__</textarea>
       </div>
     </section>
 
+    <section id="dashboard" class="dashboard" aria-label="扫描概览">
+      <div class="dashboard-grid">
+        <article class="dashboard-card dashboard-primary">
+          <div class="dashboard-label"><span class="section-icon" data-icon="gauge"></span>当前状态</div>
+          <strong id="dashboardState">准备就绪</strong>
+          <span id="dashboardRoot" class="dashboard-meta">选择位置开始分析</span>
+        </article>
+        <article class="dashboard-card">
+          <div class="dashboard-label"><span class="section-icon" data-icon="file"></span>扫描文件</div>
+          <strong id="dashboardFiles">—</strong>
+          <span id="dashboardBytes" class="dashboard-meta">尚未开始扫描</span>
+        </article>
+        <article class="dashboard-card">
+          <div class="dashboard-label"><span class="section-icon" data-icon="copy"></span>重复可回收</div>
+          <strong id="dashboardDuplicates">—</strong>
+          <span id="dashboardDuplicateMeta" class="dashboard-meta">等待内容分析</span>
+        </article>
+        <article class="dashboard-card">
+          <div class="dashboard-label"><span class="section-icon" data-icon="trash"></span>清理计划</div>
+          <strong id="dashboardPlan">—</strong>
+          <span id="dashboardPlanMeta" class="dashboard-meta">尚未选择文件</span>
+        </article>
+      </div>
+      <div class="dashboard-lower">
+        <article class="card visual-panel">
+          <div class="panel-head">
+            <div><h2><span class="section-icon" data-icon="chart"></span>空间画像</h2><span class="muted">不同指标可能重叠，仅用于定位重点</span></div>
+            <span id="dashboardChartMeta" class="panel-kicker">未扫描</span>
+          </div>
+          <div id="spaceChart" class="space-chart" role="img" aria-label="空间画像尚未生成"></div>
+        </article>
+        <article class="card visual-panel">
+          <div class="panel-head">
+            <div><h2><span class="section-icon" data-icon="activity"></span>扫描质量</h2><span class="muted">可解释的本地指标</span></div>
+            <span id="dashboardHealthState" class="panel-kicker">待开始</span>
+          </div>
+          <div id="dashboardHealth" class="health-list"></div>
+          <p id="dashboardHealthNote" class="hint health-note">读取错误和规则排除会在扫描完成后说明。</p>
+          <details id="scanErrorDetails" class="error-details hidden">
+            <summary>查看诊断明细</summary>
+            <div id="scanErrorCounts" class="error-counts"></div>
+            <ul id="scanErrorSamples" class="error-samples"></ul>
+          </details>
+        </article>
+      </div>
+      <section class="card guide-panel">
+        <div class="panel-head">
+          <div><h2><span class="section-icon" data-icon="spark"></span>新手分析指南</h2><span class="muted">按固定顺序看报告，不需要先懂专业术语</span></div>
+          <span id="analysisGuideState" class="panel-kicker">待开始</span>
+        </div>
+        <ol id="analysisGuide" class="guide-list"></ol>
+        <p id="analysisGuideNote" class="hint guide-note">完成一次扫描后，这里会告诉你下一步先看什么。</p>
+      </section>
+    </section>
+
     <section id="folderSection" class="card folders hidden">
       <div class="results-head">
         <div>
-          <h2>文件夹占用</h2>
+          <h2><span class="section-icon" data-icon="folder"></span>文件夹占用</h2>
           <span id="folderPath" class="muted">—</span>
         </div>
-        <button id="folderUp" class="ghost" disabled>返回上一级</button>
+        <button id="folderUp" class="ghost" disabled><span class="button-icon" data-icon="arrowUp"></span>返回上一级</button>
       </div>
       <div class="table-wrap folder-table">
         <table>
@@ -256,7 +342,7 @@ __pycache__</textarea>
     <section id="duplicateSection" class="card duplicates hidden">
       <div class="results-head">
         <div>
-          <h2>重复文件</h2>
+          <h2><span class="section-icon" data-icon="copy"></span>重复文件</h2>
           <span id="duplicateSummary" class="muted">尚未检测</span>
         </div>
       </div>
@@ -266,12 +352,12 @@ __pycache__</textarea>
     <section class="card plan">
       <div class="results-head">
         <div>
-          <h2>清理计划</h2>
+          <h2><span class="section-icon" data-icon="clipboard"></span>清理计划</h2>
           <span id="planSummary" class="muted">尚未加入文件</span>
         </div>
         <div class="head-actions">
-          <button id="clearPlan" class="ghost" disabled>清空计划</button>
-          <button id="executePlan" class="primary" disabled>确认并移入回收站</button>
+          <button id="clearPlan" class="ghost" disabled><span class="button-icon" data-icon="clear"></span>清空计划</button>
+          <button id="executePlan" class="primary" disabled><span class="button-icon" data-icon="trash"></span>确认并移入回收站</button>
         </div>
       </div>
       <div class="table-wrap plan-table">
@@ -287,7 +373,7 @@ __pycache__</textarea>
     <section class="card results">
       <div class="results-head">
         <div>
-          <h2>大文件</h2>
+          <h2><span class="section-icon" data-icon="file"></span>大文件</h2>
           <span id="count" class="muted">尚未扫描</span>
         </div>
         <div class="head-actions">
@@ -296,10 +382,11 @@ __pycache__</textarea>
             <span class="review">需确认</span>
             <span class="danger">不建议删除</span>
           </div>
-          <button id="exportJson" class="ghost">导出 JSON</button>
-          <button id="exportCsv" class="ghost">导出 CSV</button>
+          <button id="exportJson" class="ghost"><span class="button-icon" data-icon="download"></span>导出 JSON</button>
+          <button id="exportCsv" class="ghost"><span class="button-icon" data-icon="download"></span>导出 CSV</button>
         </div>
       </div>
+      <p class="hint export-hint">CSV 适合在 Excel/Numbers 中筛选，JSON 包含扫描摘要；文件会保存到浏览器的下载文件夹。</p>
       <div class="filters">
         <input id="search" type="search" placeholder="搜索路径或文件名">
         <select id="adviceFilter" aria-label="建议筛选">
@@ -322,8 +409,8 @@ __pycache__</textarea>
       <div id="selectionBar" class="selection-bar">
         <label><input id="selectVisible" type="checkbox"> 选择当前可清理结果</label>
         <span id="selectionSummary" class="muted">尚未选择文件</span>
-        <button id="clearSelection" class="ghost" disabled>清除选择</button>
-        <button id="trashSelected" class="primary" disabled>加入清理计划</button>
+        <button id="clearSelection" class="ghost" disabled><span class="button-icon" data-icon="clear"></span>清除选择</button>
+        <button id="trashSelected" class="primary" disabled><span class="button-icon" data-icon="clipboard"></span>加入清理计划</button>
       </div>
       <div class="table-wrap">
         <table>

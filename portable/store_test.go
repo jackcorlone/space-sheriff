@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -45,6 +47,37 @@ func TestStoreMigratesAndRejectsNewerSchema(t *testing.T) {
 	}
 }
 
+func TestStoreMigratesV3ScheduleBudgets(t *testing.T) {
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "v3.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("CREATE TABLE scan_schedules(id TEXT PRIMARY KEY); PRAGMA user_version = 3"); err != nil {
+		t.Fatal(err)
+	}
+	store := &Store{db: db}
+	if err := store.migrateV4(); err != nil {
+		t.Fatal(err)
+	}
+	var version int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 4 {
+		t.Fatalf("migrated schema version = %d, want 4", version)
+	}
+	for _, column := range []string{"max_bytes", "max_duration_seconds"} {
+		var count int
+		if err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('scan_schedules') WHERE name = ?", column).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("migration did not add %s", column)
+		}
+	}
+}
+
 func TestStoreHashCacheRequiresMatchingMetadata(t *testing.T) {
 	store, _ := testStore(t)
 	sessionID, err := store.beginScan(t.TempDir())
@@ -69,6 +102,30 @@ func TestStoreHashCacheRequiresMatchingMetadata(t *testing.T) {
 	record.Size++
 	if _, ok, err := store.cachedHash(record); err != nil || ok {
 		t.Fatalf("changed metadata reused cache: ok=%v err=%v", ok, err)
+	}
+}
+
+func TestStoreSaveFilesContextCancellationIsAtomic(t *testing.T) {
+	store, _ := testStore(t)
+	sessionID, err := store.beginScan(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	records := []FileRecord{
+		{Identity: "one", Path: "/one", Size: 1, ModifiedUnixNano: 1},
+		{Identity: "two", Path: "/two", Size: 2, ModifiedUnixNano: 2},
+	}
+	if err := store.saveFilesContext(ctx, records, sessionID); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled batch got %v, want context canceled", err)
+	}
+	var count int
+	if err := store.db.QueryRow("SELECT COUNT(*) FROM files").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("cancelled batch partially committed %d files", count)
 	}
 }
 
@@ -192,6 +249,41 @@ func TestStoreDoesNotRecoverRecentWorkFromAnotherProcess(t *testing.T) {
 	}
 	if state != "walking" {
 		t.Fatalf("recent concurrent scan was changed to %q", state)
+	}
+}
+
+func TestStoreDoesNotRecoverLongRunningScheduledScanWithFreshLease(t *testing.T) {
+	store, _ := testStore(t)
+	sessionID, err := store.beginScanWithContext(
+		t.TempDir(), "scheduled-id", "scheduled", balancedPolicy(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-scheduleLeaseTTL - time.Minute)
+	if _, err := store.db.Exec(
+		"UPDATE scan_sessions SET started_at = ? WHERE id = ?",
+		old.UnixNano(), sessionID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(
+		"INSERT INTO schedule_leases(schedule_id, owner, acquired_at) VALUES(?, ?, ?)",
+		"scheduled-id", "live-owner", time.Now().UnixNano(),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.recoverInterrupted(); err != nil {
+		t.Fatal(err)
+	}
+	var state string
+	if err := store.db.QueryRow(
+		"SELECT state FROM scan_sessions WHERE id = ?", sessionID,
+	).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != "walking" {
+		t.Fatalf("fresh-lease scheduled scan was changed to %q", state)
 	}
 }
 

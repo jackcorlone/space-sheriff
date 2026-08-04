@@ -3,7 +3,9 @@
 package main
 
 import (
+	"bytes"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -177,6 +179,41 @@ func (platformScheduleBackend) Remove(id string) error {
 		return removeErr
 	}
 	return nil
+}
+
+func (platformScheduleBackend) Inspect(schedule ScanSchedule, executable, dataDir string) (scheduleInspection, error) {
+	path, err := launchAgentPath(schedule.ID)
+	if err != nil {
+		return scheduleInspection{State: "unknown"}, err
+	}
+	data, readErr := os.ReadFile(path)
+	if errors.Is(readErr, os.ErrNotExist) {
+		if schedule.Enabled {
+			return scheduleInspection{State: "missing", Message: "LaunchAgent 文件不存在"}, nil
+		}
+		return scheduleInspection{State: "ok"}, nil
+	}
+	if readErr != nil {
+		return scheduleInspection{State: "unknown"}, readErr
+	}
+	if !schedule.Enabled {
+		return scheduleInspection{State: "drifted", Message: "停用计划仍保留 LaunchAgent 文件"}, nil
+	}
+	expected, err := launchAgentData(schedule, executable, dataDir)
+	if err != nil {
+		return scheduleInspection{State: "unknown"}, err
+	}
+	if !bytes.Equal(data, expected) {
+		return scheduleInspection{State: "drifted", Message: "LaunchAgent 配置已被修改"}, nil
+	}
+	service := launchDomain() + "/com.spacesheriff.scan." + schedule.ID
+	if output, commandErr := exec.Command("launchctl", "print", service).CombinedOutput(); commandErr != nil {
+		if launchctlServiceMissing(string(output)) {
+			return scheduleInspection{State: "missing", Message: "LaunchAgent 尚未加载"}, nil
+		}
+		return scheduleInspection{State: "unknown"}, fmt.Errorf("launchctl print: %s", string(output))
+	}
+	return scheduleInspection{State: "ok"}, nil
 }
 
 func launchctlServiceMissing(output string) bool {
