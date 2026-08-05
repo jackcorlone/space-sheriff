@@ -57,7 +57,27 @@ func intersects(parts, candidates map[string]bool) bool {
 	return false
 }
 
+func isProtectedSystemPath(path string) bool {
+	parts := pathParts(path)
+	if intersects(parts, coreSystemParts) {
+		return true
+	}
+	for part := range protectedParts {
+		if part == "library" && parts["users"] && intersects(parts, cacheParts) {
+			continue
+		}
+		if parts[part] {
+			return true
+		}
+	}
+	return false
+}
+
 func advise(path string, size int64, modified, now time.Time) Advice {
+	return adviseWithPolicy(balancedPolicy(), path, size, modified, now)
+}
+
+func adviseWithPolicy(policy Policy, path string, size int64, modified, now time.Time) Advice {
 	parts := pathParts(path)
 	ext := strings.ToLower(filepath.Ext(path))
 	age := int(now.Sub(modified).Hours() / 24)
@@ -68,13 +88,16 @@ func advise(path string, size int64, modified, now time.Time) Advice {
 	if intersects(parts, coreSystemParts) {
 		return Advice{"danger", "不建议删除", "位于核心系统目录，删除可能导致系统或软件无法运行。", 0, "SYSTEM_CORE", "系统文件"}
 	}
-	if installerExts[ext] && age >= 30 {
+	if isProtectedSystemPath(path) {
+		return Advice{"danger", "不建议删除", "位于系统或应用目录，删除可能导致系统或软件无法运行。", 0, "SYSTEM_PROTECTED", "系统文件"}
+	}
+	if installerExts[ext] && age >= policy.InstallerMinAgeDays {
 		return Advice{
 			"safe",
 			"通常可清理",
 			"这是安装镜像或安装包，已 " + dayText(age) + " 未修改；确认软件已安装后可移入回收站。",
 			80,
-			"INSTALLER_OLD_30D",
+			"INSTALLER_OLD",
 			"安装包",
 		}
 	}
@@ -82,9 +105,9 @@ func advise(path string, size int64, modified, now time.Time) Advice {
 		return Advice{"review", "需人工确认", "可能是个人文件。请先预览或备份，再决定是否删除。", 35, "PERSONAL_FILE", "个人文件"}
 	}
 	if intersects(parts, cacheParts) {
-		if age >= 7 {
+		if age >= policy.CacheMinAgeDays {
 			score := 75
-			if age >= 30 {
+			if age >= policy.CacheHighConfidenceDays {
 				score = 90
 			}
 			return Advice{
@@ -92,20 +115,17 @@ func advise(path string, size int64, modified, now time.Time) Advice {
 				"通常可清理",
 				"位于缓存、临时或日志目录，已 " + dayText(age) + " 未修改，通常可由应用重新生成。",
 				score,
-				"CACHE_OLD_7D",
+				"CACHE_OLD",
 				"缓存与日志",
 			}
 		}
 		return Advice{"review", "需人工确认", "位于缓存、临时或日志目录，但文件仅 " + dayText(age) + " 未修改，可能仍在使用。", 45, "CACHE_RECENT", "缓存与日志"}
 	}
-	if intersects(parts, protectedParts) {
-		return Advice{"danger", "不建议删除", "位于系统或应用目录，删除可能导致系统或软件无法运行。", 0, "SYSTEM_PROTECTED", "系统文件"}
+	if archiveExts[ext] && age >= policy.ArchiveMinAgeDays {
+		return Advice{"review", "可考虑清理", "这是压缩包，已 " + dayText(age) + " 未修改；请确认内容已有副本或已解压。", 60, "ARCHIVE_OLD", "压缩包"}
 	}
-	if archiveExts[ext] && age >= 90 {
-		return Advice{"review", "可考虑清理", "这是压缩包，已 " + dayText(age) + " 未修改；请确认内容已有副本或已解压。", 60, "ARCHIVE_OLD_90D", "压缩包"}
-	}
-	if size >= 10*1024*1024*1024 && age >= 180 {
-		return Advice{"review", "可考虑清理", "文件超过 10 GB 且已 " + dayText(age) + " 未修改，但用途未知。", 55, "LARGE_STALE_180D", "大型文件"}
+	if size >= policy.LargeStaleMinBytes && age >= policy.LargeStaleMinAgeDays {
+		return Advice{"review", "可考虑清理", "文件达到当前策略的大文件阈值，且已 " + dayText(age) + " 未修改，但用途未知。", 55, "LARGE_STALE", "大型文件"}
 	}
 	return Advice{"review", "需人工确认", "未发现明确的安全清理特征，请确认用途后再处理。", 40, "UNKNOWN", "其他"}
 }

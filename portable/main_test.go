@@ -3,12 +3,37 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
+
+func captureStdout(t *testing.T, fn func() error) string {
+	t.Helper()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := os.Stdout
+	os.Stdout = writer
+	callErr := fn()
+	_ = writer.Close()
+	os.Stdout = original
+	output, readErr := io.ReadAll(reader)
+	_ = reader.Close()
+	if callErr != nil {
+		t.Fatal(callErr)
+	}
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	return string(output)
+}
 
 func TestSecureRequiresSessionTokenForAPI(t *testing.T) {
 	app := &server{token: "expected"}
@@ -43,6 +68,28 @@ func TestSecureRequiresSessionTokenForAPI(t *testing.T) {
 	}
 }
 
+func TestSecureAcceptsJSONCharsetAndRejectsOtherMediaTypes(t *testing.T) {
+	app := &server{token: "expected"}
+	handler := app.secure(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	for contentType, expected := range map[string]int{
+		"application/json; charset=utf-8": http.StatusNoContent,
+		"text/plain":                      http.StatusUnsupportedMediaType,
+		"":                                http.StatusUnsupportedMediaType,
+	} {
+		request := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:1234/api/test", strings.NewReader("{}"))
+		request.Host = "127.0.0.1:1234"
+		request.Header.Set("X-Space-Sheriff-Token", "expected")
+		request.Header.Set("Content-Type", contentType)
+		result := httptest.NewRecorder()
+		handler.ServeHTTP(result, request)
+		if result.Code != expected {
+			t.Fatalf("content type %q got %d, want %d", contentType, result.Code, expected)
+		}
+	}
+}
+
 func TestNewSessionTokenAllowsDeterministicLocalTesting(t *testing.T) {
 	t.Setenv("SPACE_SHERIFF_SESSION_TOKEN", "test-token")
 	token, err := newSessionToken()
@@ -51,6 +98,43 @@ func TestNewSessionTokenAllowsDeterministicLocalTesting(t *testing.T) {
 	}
 	if token != "test-token" {
 		t.Fatalf("got %q, want test-token", token)
+	}
+}
+
+func TestNewSessionTokenIsRandomByDefault(t *testing.T) {
+	t.Setenv("SPACE_SHERIFF_SESSION_TOKEN", "")
+	first, err := newSessionToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := newSessionToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) != 64 || first == second {
+		t.Fatalf("unexpected tokens %q and %q", first, second)
+	}
+}
+
+func TestDecodeJSONRejectsUnknownAndTrailingValues(t *testing.T) {
+	for _, body := range []string{
+		`{"id":"balanced","typo":true}`,
+		`{"id":"balanced"} {"id":"conservative"}`,
+	} {
+		var request struct {
+			ID string `json:"id"`
+		}
+		result := httptest.NewRecorder()
+		if decodeJSON(
+			result,
+			httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body)),
+			&request,
+		) {
+			t.Fatalf("invalid JSON was accepted: %s", body)
+		}
+		if result.Code != http.StatusBadRequest {
+			t.Fatalf("invalid JSON got %d", result.Code)
+		}
 	}
 }
 
@@ -132,5 +216,365 @@ func TestTrashBatchReportsEachUniqueFailure(t *testing.T) {
 		if item.Error == "" {
 			t.Fatalf("missing error for %+v", item)
 		}
+	}
+}
+
+func TestTrashBatchKeepsOneDuplicateCopy(t *testing.T) {
+	app := &server{job: &scanJob{
+		status: ScanStatus{
+			State: "done",
+			DuplicateGroups: []DuplicateGroup{{
+				ID:    "group",
+				Files: []FileRecord{{Path: "one"}, {Path: "two"}},
+			}},
+		},
+	}}
+	body := bytes.NewBufferString(`{"paths":["one","two"]}`)
+	result := httptest.NewRecorder()
+	app.trashBatch(result, httptest.NewRequest(http.MethodPost, "/api/trash-batch", body))
+	if result.Code != http.StatusBadRequest {
+		t.Fatalf("got %d, want 400", result.Code)
+	}
+}
+
+func TestPlanHandlerPersistsKnownRecords(t *testing.T) {
+	store, _ := testStore(t)
+	path := filepath.Join("workspace", "candidate.bin")
+	record := FileRecord{
+		Path:             path,
+		Identity:         "identity",
+		Size:             10,
+		ModifiedUnixNano: 20,
+		Advice:           Advice{Level: "review", Label: "需人工确认", RuleID: "TEST"},
+	}
+	app := &server{
+		store: store,
+		job: &scanJob{
+			status: ScanStatus{State: "done"},
+			known:  map[string]FileRecord{path: record},
+		},
+	}
+	body := bytes.NewBufferString(`{"paths":[` + strconvQuote(path) + `]}`)
+	result := httptest.NewRecorder()
+	app.plan(result, httptest.NewRequest(http.MethodPost, "/api/plan", body))
+	if result.Code != http.StatusOK {
+		t.Fatalf("save plan got %d: %s", result.Code, result.Body.String())
+	}
+
+	getResult := httptest.NewRecorder()
+	app.plan(getResult, httptest.NewRequest(http.MethodGet, "/api/plan", nil))
+	var records []FileRecord
+	if err := json.NewDecoder(getResult.Body).Decode(&records); err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].Path != path || records[0].Advice.RuleID != "TEST" {
+		t.Fatalf("unexpected plan response: %+v", records)
+	}
+}
+
+func TestPlanHandlerHidesProtectedRecords(t *testing.T) {
+	store, _ := testStore(t)
+	if err := store.replacePlan([]FileRecord{
+		{Path: "workspace/candidate.bin", Advice: Advice{Level: "review"}},
+		{Path: "/System/Library/AssetsV2/mock.dmg", Advice: Advice{Level: "safe"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result := httptest.NewRecorder()
+	(&server{store: store}).plan(result, httptest.NewRequest(http.MethodGet, "/api/plan", nil))
+	if result.Code != http.StatusOK {
+		t.Fatalf("get plan got %d: %s", result.Code, result.Body.String())
+	}
+	var records []FileRecord
+	if err := json.NewDecoder(result.Body).Decode(&records); err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].Path != "workspace/candidate.bin" {
+		t.Fatalf("protected record was exposed: %+v", records)
+	}
+}
+
+func TestPlanHandlerWithoutStoreIsReadOnly(t *testing.T) {
+	app := &server{}
+	getResult := httptest.NewRecorder()
+	app.plan(getResult, httptest.NewRequest(http.MethodGet, "/api/plan", nil))
+	if getResult.Code != http.StatusOK || strings.TrimSpace(getResult.Body.String()) != "[]" {
+		t.Fatalf("unexpected empty plan response: %d %s", getResult.Code, getResult.Body.String())
+	}
+	postResult := httptest.NewRecorder()
+	app.plan(postResult, httptest.NewRequest(http.MethodPost, "/api/plan", bytes.NewBufferString(`{"paths":[]}`)))
+	if postResult.Code != http.StatusServiceUnavailable {
+		t.Fatalf("post without store got %d, want 503", postResult.Code)
+	}
+}
+
+func TestGovernanceHandlers(t *testing.T) {
+	store, _ := testStore(t)
+	app := &server{store: store}
+
+	policiesResult := httptest.NewRecorder()
+	app.policies(policiesResult, httptest.NewRequest(http.MethodGet, "/api/policies", nil))
+	if policiesResult.Code != http.StatusOK {
+		t.Fatalf("policies got %d: %s", policiesResult.Code, policiesResult.Body.String())
+	}
+	var state PolicyState
+	if err := json.NewDecoder(policiesResult.Body).Decode(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state.ActiveID != "balanced" || len(state.Policies) != 3 {
+		t.Fatalf("unexpected policy state: %+v", state)
+	}
+
+	activateResult := httptest.NewRecorder()
+	app.activatePolicy(
+		activateResult,
+		httptest.NewRequest(
+			http.MethodPost, "/api/policies/activate",
+			bytes.NewBufferString(`{"id":"conservative"}`),
+		),
+	)
+	if activateResult.Code != http.StatusOK {
+		t.Fatalf("activate got %d: %s", activateResult.Code, activateResult.Body.String())
+	}
+
+	custom := balancedPolicy()
+	custom.ID = "handler-policy"
+	custom.Name = "Handler Policy"
+	custom.BuiltIn = false
+	document, _ := json.Marshal(custom)
+	importResult := httptest.NewRecorder()
+	app.importPolicy(
+		importResult,
+		httptest.NewRequest(http.MethodPost, "/api/policies/import", bytes.NewReader(document)),
+	)
+	if importResult.Code != http.StatusOK {
+		t.Fatalf("import got %d: %s", importResult.Code, importResult.Body.String())
+	}
+
+	healthResult := httptest.NewRecorder()
+	app.maintenance(healthResult, httptest.NewRequest(http.MethodGet, "/api/maintenance", nil))
+	if healthResult.Code != http.StatusOK || !strings.Contains(healthResult.Body.String(), `"integrity":"ok"`) {
+		t.Fatalf("health got %d: %s", healthResult.Code, healthResult.Body.String())
+	}
+	invalidMaintenance := httptest.NewRecorder()
+	app.maintenance(
+		invalidMaintenance,
+		httptest.NewRequest(http.MethodPost, "/api/maintenance", bytes.NewBufferString(`{"action":"erase"}`)),
+	)
+	if invalidMaintenance.Code != http.StatusBadRequest {
+		t.Fatalf("invalid maintenance got %d, want 400", invalidMaintenance.Code)
+	}
+}
+
+func TestAuditHandlerValidatesQueries(t *testing.T) {
+	store, _ := testStore(t)
+	app := &server{store: store}
+	invalid := httptest.NewRecorder()
+	app.audit(invalid, httptest.NewRequest(http.MethodGet, "/api/audit?limit=200", nil))
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid limit got %d, want 400", invalid.Code)
+	}
+	missing := httptest.NewRecorder()
+	app.audit(missing, httptest.NewRequest(http.MethodGet, "/api/audit?id=missing", nil))
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing audit got %d, want 404", missing.Code)
+	}
+	list := httptest.NewRecorder()
+	app.audit(list, httptest.NewRequest(http.MethodGet, "/api/audit?limit=10", nil))
+	if list.Code != http.StatusOK || strings.TrimSpace(list.Body.String()) != "[]" {
+		t.Fatalf("empty audit got %d: %s", list.Code, list.Body.String())
+	}
+}
+
+func TestVersionStatusAndCancelHandlers(t *testing.T) {
+	app := &server{}
+
+	versionResult := httptest.NewRecorder()
+	app.version(versionResult, httptest.NewRequest(http.MethodGet, "/api/version", nil))
+	if versionResult.Code != http.StatusOK || !strings.Contains(versionResult.Body.String(), `"version":"1.0.0"`) ||
+		!strings.Contains(versionResult.Body.String(), `"apiVersion":"v1"`) ||
+		!strings.Contains(versionResult.Body.String(), `"schemaVersion":4`) {
+		t.Fatalf("unexpected version response: %d %s", versionResult.Code, versionResult.Body.String())
+	}
+
+	statusResult := httptest.NewRecorder()
+	app.status(statusResult, httptest.NewRequest(http.MethodGet, "/api/status", nil))
+	if statusResult.Code != http.StatusOK || !strings.Contains(statusResult.Body.String(), `"state":"idle"`) {
+		t.Fatalf("unexpected status response: %d %s", statusResult.Code, statusResult.Body.String())
+	}
+
+	cancelled := false
+	app.job = &scanJob{cancel: func() { cancelled = true }}
+	cancelResult := httptest.NewRecorder()
+	app.cancel(cancelResult, httptest.NewRequest(http.MethodPost, "/api/cancel", nil))
+	if cancelResult.Code != http.StatusOK || !cancelled {
+		t.Fatalf("cancel response: %d, cancelled=%v", cancelResult.Code, cancelled)
+	}
+}
+
+func TestStableCLIHelpAndVersion(t *testing.T) {
+	versionOutput := captureStdout(t, func() error {
+		return runApplication([]string{"--version"})
+	})
+	if strings.TrimSpace(versionOutput) != "1.0.0" {
+		t.Fatalf("version output = %q", versionOutput)
+	}
+	dataDir := filepath.Join(t.TempDir(), "not-created")
+	helpOutput := captureStdout(t, func() error {
+		return runApplication([]string{"--scheduled-scan", "--help", "--data-dir", dataDir})
+	})
+	for _, expected := range []string{"--scheduled-scan PLAN_ID", "--data-dir PATH", "--version"} {
+		if !strings.Contains(helpOutput, expected) {
+			t.Fatalf("help output missing %q: %s", expected, helpOutput)
+		}
+	}
+	if _, err := os.Stat(dataDir); !os.IsNotExist(err) {
+		t.Fatalf("help unexpectedly initialized data dir: %v", err)
+	}
+}
+
+func TestQuitCancelsActiveScan(t *testing.T) {
+	done := make(chan struct{})
+	cancelled := false
+	app := &server{job: &scanJob{
+		status: ScanStatus{State: "running"},
+		cancel: func() {
+			cancelled = true
+			close(done)
+		},
+		done: done,
+	}}
+	result := httptest.NewRecorder()
+	app.quit(result, httptest.NewRequest(http.MethodPost, "/api/quit", nil))
+	if result.Code != http.StatusOK || !cancelled {
+		t.Fatalf("quit did not cancel active scan: code=%d cancelled=%v", result.Code, cancelled)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("quit did not finish scan cancellation")
+	}
+}
+
+func TestStartScanValidatesAndCompletes(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "file.bin"), []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	app := &server{}
+	body := bytes.NewBufferString(`{"path":` + strconvQuote(root) + `,"minimum":0,"duplicateMinimum":1048576,"limit":20,"excludes":[".git"]}`)
+	result := httptest.NewRecorder()
+	app.startScan(result, httptest.NewRequest(http.MethodPost, "/api/scan", body))
+	if result.Code != http.StatusOK {
+		t.Fatalf("start scan got %d: %s", result.Code, result.Body.String())
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for app.job.snapshot().State == "running" && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	status := app.job.snapshot()
+	if status.State != "done" || status.FilesSeen != 1 {
+		t.Fatalf("unexpected completed scan: %+v", status)
+	}
+
+	budgetApp := &server{}
+	budgetResult := httptest.NewRecorder()
+	budgetBody := bytes.NewBufferString(`{"path":` + strconvQuote(root) + `,"minimum":0,"maxBytes":1}`)
+	budgetApp.startScan(budgetResult, httptest.NewRequest(http.MethodPost, "/api/scan", budgetBody))
+	if budgetResult.Code != http.StatusOK {
+		t.Fatalf("budget scan start got %d: %s", budgetResult.Code, budgetResult.Body.String())
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for budgetApp.job.snapshot().State == "running" && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if status := budgetApp.job.snapshot(); status.State != "budget_exceeded" || status.BudgetExceeded == "" {
+		t.Fatalf("budget scan did not stop explicitly: %+v", status)
+	}
+
+	invalidResult := httptest.NewRecorder()
+	invalidBody := bytes.NewBufferString(`{"path":"/path/that/does/not/exist"}`)
+	app.startScan(invalidResult, httptest.NewRequest(http.MethodPost, "/api/scan", invalidBody))
+	if invalidResult.Code != http.StatusBadRequest {
+		t.Fatalf("invalid path got %d, want 400", invalidResult.Code)
+	}
+	for _, body := range []string{
+		`{"path":` + strconvQuote(root) + `,"minimum":-1}`,
+		`{"path":` + strconvQuote(root) + `,"duplicateMinimum":1}`,
+		`{"path":` + strconvQuote(root) + `,"limit":0}`,
+		`{"path":` + strconvQuote(root) + `,"maxBytes":-1}`,
+		`{"path":` + strconvQuote(root) + `,"maxDurationSeconds":604801}`,
+	} {
+		invalidOptions := httptest.NewRecorder()
+		app.startScan(invalidOptions, httptest.NewRequest(http.MethodPost, "/api/scan", strings.NewReader(body)))
+		if invalidOptions.Code != http.StatusBadRequest {
+			t.Fatalf("invalid scan options got %d for %s", invalidOptions.Code, body)
+		}
+	}
+}
+
+func strconvQuote(value string) string {
+	encoded, _ := json.Marshal(value)
+	return string(encoded)
+}
+
+func TestTrashOneRejectsUnsafeStates(t *testing.T) {
+	app := &server{}
+	if _, err := app.trashOne("missing"); err == nil {
+		t.Fatal("trash without scan was allowed")
+	}
+
+	app.job = &scanJob{
+		status: ScanStatus{State: "running"},
+		known:  map[string]FileRecord{"file": {Path: "file"}},
+	}
+	if _, err := app.trashOne("file"); err == nil {
+		t.Fatal("trash during scan was allowed")
+	}
+
+	app.job.status.State = "done"
+	app.job.known["system"] = FileRecord{Path: "system", Advice: Advice{Level: "danger"}}
+	app.job.known["system-installer"] = FileRecord{
+		Path:   "/System/Library/AssetsV2/mock.dmg",
+		Advice: Advice{Level: "safe"},
+	}
+	if _, err := app.trashOne("unknown"); err == nil {
+		t.Fatal("unknown file was allowed")
+	}
+	if _, err := app.trashOne("system"); err == nil {
+		t.Fatal("protected file was allowed")
+	}
+	if _, err := app.trashOne("system-installer"); err == nil {
+		t.Fatal("protected system installer was allowed")
+	}
+}
+
+func TestRemoveRecordUpdatesFoldersAndDuplicateGroups(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "one.bin")
+	other := filepath.Join(root, "two.bin")
+	record := FileRecord{Path: path, Size: 10}
+	job := &scanJob{
+		status: ScanStatus{
+			Root:    root,
+			Results: []FileRecord{record},
+			DuplicateGroups: []DuplicateGroup{{
+				ID: "group", Size: 10, Reclaimable: 10,
+				Files: []FileRecord{record, {Path: other, Size: 10}},
+			}},
+		},
+		known:           map[string]FileRecord{path: record, other: {Path: other, Size: 10}},
+		folders:         map[string]FolderRecord{root: {Path: root, Size: 20, FileCount: 2}},
+		duplicateByPath: map[string]string{path: "group", other: "group"},
+	}
+	job.removeRecordLocked(record)
+	if len(job.status.Results) != 0 || len(job.status.DuplicateGroups) != 0 {
+		t.Fatalf("record remained: %+v", job.status)
+	}
+	if job.folders[root].Size != 10 || job.folders[root].FileCount != 1 {
+		t.Fatalf("folder not updated: %+v", job.folders[root])
+	}
+	if job.duplicateByPath[other] != "" {
+		t.Fatal("remaining single file still marked duplicate")
 	}
 }
