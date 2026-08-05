@@ -43,6 +43,9 @@
 
 当前 v1.0 仍是本地稳定候选；正式签名安装包需等待独立机器完成 Windows/macOS 任务、签名和压力验收。
 
+分享给中国朋友时，建议使用 Gitee 镜像或 `dist/portable-v1.0.0/` 中的便携包；完整步骤见
+[面向朋友分享](docs/distribution/share-with-friends.md)。便携包是未签名内部测试候选，分享前请保留对应的 `SHA256SUMS.txt`。
+
 ### Windows
 
 - 普通 Intel/AMD 电脑：双击 `SpaceSheriff-Windows-x64.exe`
@@ -179,6 +182,7 @@ docs/releases/         版本发布说明
 docs/architecture/     架构与可靠性设计
 docs/planning/         缺陷审查与未来路线图
 docs/testing/          版本黑白盒测试报告
+docs/distribution/     源码镜像与朋友分享说明
 ```
 
 ## 参与贡献与许可证
