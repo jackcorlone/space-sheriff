@@ -237,12 +237,23 @@ func TestTrashBatchKeepsOneDuplicateCopy(t *testing.T) {
 	}
 }
 
-func TestPlanPreflightChecksCurrentFilesWithoutChangingThem(t *testing.T) {
-	root, err := os.MkdirTemp("/private/tmp", "space-sheriff-preflight-")
+
+func testWritableDir(t *testing.T) string {
+	t.Helper()
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.MkdirTemp(home, "space-sheriff-test-")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	return root
+}
+
+func TestPlanPreflightChecksCurrentFilesWithoutChangingThem(t *testing.T) {
+	root := testWritableDir(t)
 	readyPath := filepath.Join(root, "ready.bin")
 	changedPath := filepath.Join(root, "changed.bin")
 	if err := os.WriteFile(readyPath, []byte("ready"), 0o600); err != nil {
@@ -301,11 +312,7 @@ func TestPlanPreflightRequiresCompletedCurrentScan(t *testing.T) {
 }
 
 func TestPlanPreflightBlocksOnlyDuplicateGroupThatWouldBeFullyRemoved(t *testing.T) {
-	root, err := os.MkdirTemp("/private/tmp", "space-sheriff-duplicates-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	root := testWritableDir(t)
 	paths := []string{filepath.Join(root, "copy-a"), filepath.Join(root, "copy-b"), filepath.Join(root, "other")}
 	known := make(map[string]FileRecord)
 	for _, path := range paths {
