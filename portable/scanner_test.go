@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -16,13 +18,58 @@ func TestScannerFiltersSortsAndLimits(t *testing.T) {
 		}
 	}
 	job := &scanJob{status: ScanStatus{State: "running"}, started: time.Now(), known: make(map[string]FileRecord)}
-	job.run(context.Background(), root, 5, 2)
+	job.run(context.Background(), root, ScanOptions{Minimum: 5, DuplicateMinimum: 1 << 60, Limit: 2})
 	status := job.snapshot()
 	if status.State != "done" || len(status.Results) != 2 {
 		t.Fatalf("unexpected status: %+v", status)
 	}
 	if status.Results[0].Size != 20 || status.Results[1].Size != 10 {
 		t.Fatalf("results not sorted: %+v", status.Results)
+	}
+}
+
+func TestScanErrorDiagnosticsAreCategorizedAndBounded(t *testing.T) {
+	job := &scanJob{}
+	for index := 0; index < maxScanErrorSamples+3; index++ {
+		job.noteError("metadata", "/tmp/example", os.ErrPermission)
+	}
+	status := job.snapshot()
+	if status.Errors != int64(maxScanErrorSamples+3) || status.ErrorCounts["metadata"] != int64(maxScanErrorSamples+3) {
+		t.Fatalf("unexpected error counters: %+v", status)
+	}
+	if len(status.ErrorSamples) != maxScanErrorSamples {
+		t.Fatalf("sample limit = %d, want %d", len(status.ErrorSamples), maxScanErrorSamples)
+	}
+	status.ErrorCounts["metadata"] = 0
+	status.ErrorSamples[0].Message = "changed"
+	if job.snapshot().ErrorCounts["metadata"] != int64(maxScanErrorSamples+3) || job.snapshot().ErrorSamples[0].Message == "changed" {
+		t.Fatal("snapshot exposed mutable diagnostic state")
+	}
+}
+
+func TestNormalizeScanRootResolvesDirectorySymlink(t *testing.T) {
+	root := t.TempDir()
+	parent := t.TempDir()
+	alias := filepath.Join(parent, "alias")
+	if err := os.Symlink(root, alias); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	resolved, err := normalizeScanRoot(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved != expected {
+		t.Fatalf("resolved root = %q, want %q", resolved, expected)
+	}
+}
+
+func TestNormalizeScanRootRejectsEmptyPath(t *testing.T) {
+	if _, err := normalizeScanRoot("  "); err == nil {
+		t.Fatal("empty root was accepted")
 	}
 }
 
@@ -48,7 +95,7 @@ func TestScannerAggregatesFolders(t *testing.T) {
 		known:   make(map[string]FileRecord),
 		folders: make(map[string]FolderRecord),
 	}
-	job.run(context.Background(), root, 0, 10)
+	job.run(context.Background(), root, ScanOptions{Minimum: 0, DuplicateMinimum: 1 << 60, Limit: 10})
 
 	view, ok := job.folderView(root)
 	if !ok || len(view.Children) != 2 {
@@ -59,5 +106,239 @@ func TestScannerAggregatesFolders(t *testing.T) {
 	}
 	if view.Children[0].Name != "a" || view.Children[0].Size != 30 || view.Children[0].FileCount != 2 {
 		t.Fatalf("unexpected largest folder: %+v", view.Children[0])
+	}
+}
+
+func TestScannerReportsPersistenceFailure(t *testing.T) {
+	store, _ := testStore(t)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "file.bin"), []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	job := &scanJob{
+		status: ScanStatus{State: "running", Root: root}, started: time.Now(),
+		known: make(map[string]FileRecord), folders: make(map[string]FolderRecord),
+		store: store, sessionID: "session",
+	}
+	job.run(context.Background(), root, ScanOptions{
+		Minimum: 0, DuplicateMinimum: 1 << 60, Limit: 10,
+	})
+	status := job.snapshot()
+	if status.State != "error" || !strings.Contains(status.Message, "保存扫描报告失败") {
+		t.Fatalf("persistence failure was hidden: %+v", status)
+	}
+}
+
+func TestScannerFindsContentDuplicatesAndHonorsExcludes(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"one.bin", filepath.Join("nested", "two.bin")} {
+		path := filepath.Join(root, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("same-content"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(root, "different.bin"), []byte("other-content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	excluded := filepath.Join(root, "excluded")
+	if err := os.MkdirAll(excluded, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(excluded, "copy.bin"), []byte("same-content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	job := &scanJob{
+		status:          ScanStatus{State: "running", Root: root},
+		started:         time.Now(),
+		known:           make(map[string]FileRecord),
+		folders:         make(map[string]FolderRecord),
+		duplicateByPath: make(map[string]string),
+	}
+	job.run(context.Background(), root, ScanOptions{
+		Minimum:          0,
+		DuplicateMinimum: 1,
+		Limit:            20,
+		Excludes:         []string{"excluded"},
+	})
+	status := job.snapshot()
+	if len(status.DuplicateGroups) != 1 {
+		t.Fatalf("got duplicate groups %+v", status.DuplicateGroups)
+	}
+	group := status.DuplicateGroups[0]
+	if len(group.Files) != 2 || group.Reclaimable != int64(len("same-content")) {
+		t.Fatalf("unexpected duplicate group: %+v", group)
+	}
+	if status.Excluded != 1 {
+		t.Fatalf("excluded count = %d, want 1", status.Excluded)
+	}
+}
+
+func TestCleanupPlanCannotRemoveEveryDuplicate(t *testing.T) {
+	group := DuplicateGroup{
+		ID: "group",
+		Files: []FileRecord{
+			{Path: "one"},
+			{Path: "two"},
+		},
+	}
+	job := &scanJob{status: ScanStatus{DuplicateGroups: []DuplicateGroup{group}}}
+	if !job.wouldRemoveEveryDuplicate([]string{"one", "two"}) {
+		t.Fatal("plan removing every copy was allowed")
+	}
+	if job.wouldRemoveEveryDuplicate([]string{"one"}) {
+		t.Fatal("plan keeping one copy was rejected")
+	}
+}
+
+func TestExcludeMatcherSupportsNamesRelativeAndAbsolutePaths(t *testing.T) {
+	root := t.TempDir()
+	absolute := filepath.Join(root, "absolute")
+	matcher := newExcludeMatcher(root, []string{"node_modules", filepath.Join("build", "cache"), absolute, ""})
+	for _, path := range []string{
+		filepath.Join(root, "app", "node_modules"),
+		filepath.Join(root, "build", "cache", "item.bin"),
+		filepath.Join(absolute, "item.bin"),
+	} {
+		if !matcher.match(path) {
+			t.Fatalf("expected exclusion for %s", path)
+		}
+	}
+	if matcher.match(filepath.Join(root, "source", "item.bin")) {
+		t.Fatal("unrelated path was excluded")
+	}
+}
+
+func TestHashFileCanBeCancelled(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "file.bin")
+	if err := os.WriteFile(path, []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := hashFile(ctx, path); err != context.Canceled {
+		t.Fatalf("got %v, want context canceled", err)
+	}
+}
+
+func TestScannerDoesNotReportHardLinksAsDuplicates(t *testing.T) {
+	root := t.TempDir()
+	original := filepath.Join(root, "original.bin")
+	link := filepath.Join(root, "link.bin")
+	if err := os.WriteFile(original, []byte("same-physical-file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(original, link); err != nil {
+		t.Skipf("hard links are unavailable: %v", err)
+	}
+	job := &scanJob{
+		status:          ScanStatus{State: "running", Root: root},
+		started:         time.Now(),
+		known:           make(map[string]FileRecord),
+		folders:         make(map[string]FolderRecord),
+		duplicateByPath: make(map[string]string),
+	}
+	job.run(context.Background(), root, ScanOptions{Minimum: 0, DuplicateMinimum: 1, Limit: 20})
+	status := job.snapshot()
+	if len(status.DuplicateGroups) != 0 {
+		t.Fatalf("hard links were reported as duplicates: %+v", status.DuplicateGroups)
+	}
+}
+
+func TestScannerReusesHashesOnSecondScan(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"one.bin", "two.bin"} {
+		if err := os.WriteFile(filepath.Join(root, name), []byte("same-content"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store, _ := testStore(t)
+	run := func() ScanStatus {
+		sessionID, err := store.beginScan(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		job := &scanJob{
+			status:          ScanStatus{State: "running", Root: root},
+			started:         time.Now(),
+			known:           make(map[string]FileRecord),
+			folders:         make(map[string]FolderRecord),
+			duplicateByPath: make(map[string]string),
+			store:           store,
+			sessionID:       sessionID,
+		}
+		job.run(context.Background(), root, ScanOptions{Minimum: 0, DuplicateMinimum: 1, Limit: 20})
+		return job.snapshot()
+	}
+	first := run()
+	second := run()
+	if first.FilesHashed != 2 || first.HashesReused != 0 {
+		t.Fatalf("unexpected first scan cache stats: %+v", first)
+	}
+	if second.FilesHashed != 0 || second.HashesReused != 2 {
+		t.Fatalf("unexpected second scan cache stats: %+v", second)
+	}
+}
+
+func TestScannerStopsWhenByteBudgetIsReached(t *testing.T) {
+	root := t.TempDir()
+	for _, name := range []string{"a.bin", "b.bin"} {
+		if err := os.WriteFile(filepath.Join(root, name), make([]byte, 4), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	job := &scanJob{
+		status:  ScanStatus{State: "running", Root: root},
+		started: time.Now(), known: make(map[string]FileRecord),
+		folders: make(map[string]FolderRecord),
+	}
+	job.run(context.Background(), root, ScanOptions{
+		Minimum: 0, DuplicateMinimum: 1 << 60, Limit: 10, MaxBytes: 5,
+	})
+	status := job.snapshot()
+	if status.State != "budget_exceeded" || status.BudgetExceeded == "" {
+		t.Fatalf("unexpected budget status: %+v", status)
+	}
+	if status.BytesSeen < 5 {
+		t.Fatalf("budget did not account for scanned bytes: %+v", status)
+	}
+}
+
+func TestStoredDuplicateScanUsesQuickFingerprintBeforeFullHash(t *testing.T) {
+	root := t.TempDir()
+	first := bytes.Repeat([]byte("a"), 2*quickFingerprintChunkSize)
+	second := bytes.Repeat([]byte("a"), 2*quickFingerprintChunkSize)
+	second[0] = 'b'
+	if err := os.WriteFile(filepath.Join(root, "one.bin"), first, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "two.bin"), second, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, _ := testStore(t)
+	sessionID, err := store.beginScan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	job := &scanJob{
+		status: ScanStatus{State: "running", Root: root}, started: time.Now(),
+		known: make(map[string]FileRecord), folders: make(map[string]FolderRecord),
+		duplicateByPath: make(map[string]string), store: store, sessionID: sessionID,
+	}
+	job.run(context.Background(), root, ScanOptions{
+		Minimum: 0, DuplicateMinimum: 1, Limit: 10,
+	})
+	status := job.snapshot()
+	if status.State != "done" || status.FilesFingerprinted != 2 || status.FilesHashed != 0 {
+		t.Fatalf("quick fingerprint did not filter candidates: %+v", status)
+	}
+	if len(status.DuplicateGroups) != 0 {
+		t.Fatalf("different content was reported as duplicate: %+v", status.DuplicateGroups)
 	}
 }
