@@ -42,12 +42,12 @@
 
 ## 直接使用
 
-前往仓库的 **Releases** 页面下载与你的系统对应的文件。
+前往 [**v1.0.0 Release**](https://github.com/jackcorlone/space-sheriff/releases/tag/v1.0.0) 下载与你的系统对应的文件，并用同页的 `SHA256SUMS.txt` 校验。
 
-当前 v1.0 仍是本地稳定候选；正式签名安装包需等待独立机器完成 Windows/macOS 任务、签名和压力验收。
+当前 v1.0.0 是**未签名的公开稳定候选**：可用，但首次启动可能被系统拦截；正式签名安装包仍需独立机器完成 Windows/macOS 任务、签名和压力验收。
 
-分享给中国朋友时，建议使用 Gitee 镜像或 `dist/portable-v1.0.0/` 中的便携包；完整步骤见
-[面向朋友分享](docs/distribution/share-with-friends.md)。便携包是未签名内部测试候选，分享前请保留对应的 `SHA256SUMS.txt`。
+分享给中国朋友时，也可使用 Gitee 镜像或本地 `dist/portable-v1.0.0/` 便携包；完整步骤见
+[面向朋友分享](docs/distribution/share-with-friends.md)。
 
 ### Windows
 
