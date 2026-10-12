@@ -15,6 +15,8 @@ let duplicateGroups = [];
 let plan = new Set();
 let persistedPlanRecords = new Map();
 let planSave = Promise.resolve();
+let planPreflight = {state: "idle", ready: false, items: []};
+let preflightRequest = 0;
 let policyState = {activeId: "", policies: []};
 let schedulesState = {backend: "", schedules: [], recent: []};
 let currentFolder = "";
@@ -184,13 +186,58 @@ function reportSummary(status = latestStatus) {
     resultCount: allRecords.length,
     duplicateGroupCount: duplicateGroups.length,
     plannedCount: plan.size,
+    changes: current.changes || null,
     guidance: guidanceForStatus(current).map((item) => ({title: item.title, action: item.body}))
   };
+}
+
+const changeKindLabel = {new: "新出现", grown: "变大", shrunk: "变小", removed: "离开结果"};
+
+function signedSize(bytes) {
+  const value = Number(bytes || 0);
+  if (!value) return "0 B";
+  return `${value > 0 ? "+" : "−"}${humanSize(Math.abs(value))}`;
+}
+
+function renderChanges(changes) {
+  if (!changes) {
+    $("changeSection").classList.add("hidden");
+    return;
+  }
+  $("changeSection").classList.remove("hidden");
+  if (!changes.baselineAvailable) {
+    $("changeSummary").textContent = "首次完成该路径扫描，已建立本地比较基线";
+    $("changeNet").textContent = "基线已建立";
+    $("changeNet").className = "change-net neutral";
+    $("changeMetrics").innerHTML = `<div class="change-empty">下次扫描同一路径后，这里会显示新增、增长、缩小和离开大文件结果的项目。</div>`;
+    $("changeTable").classList.add("hidden");
+    return;
+  }
+  const total = Number(changes.newCount || 0) + Number(changes.grownCount || 0) + Number(changes.shrunkCount || 0) + Number(changes.removedCount || 0);
+  $("changeSummary").textContent = `与 ${changes.baselineAt || "上次"} 的大文件结果比较 · ${total.toLocaleString()} 项变化`;
+  $("changeNet").textContent = `净变化 ${signedSize(changes.netBytes)}`;
+  $("changeNet").className = `change-net ${changes.netBytes > 0 ? "increase" : changes.netBytes < 0 ? "decrease" : "neutral"}`;
+  $("changeMetrics").innerHTML = [
+    ["新出现", changes.newCount || 0, "new"],
+    ["变大", changes.grownCount || 0, "grown"],
+    ["变小", changes.shrunkCount || 0, "shrunk"],
+    ["离开结果", changes.removedCount || 0, "removed"]
+  ].map(([label, count, tone]) => `<div class="change-metric ${tone}"><span>${label}</span><strong>${Number(count).toLocaleString()}</strong></div>`).join("");
+  const items = Array.isArray(changes.items) ? changes.items : [];
+  $("changeTable").classList.toggle("hidden", items.length === 0);
+  $("changeRows").innerHTML = items.map((item) => `
+    <tr>
+      <td><span class="change-badge ${escapeHTML(item.kind)}">${escapeHTML(changeKindLabel[item.kind] || item.kind)}</span></td>
+      <td class="change-delta ${item.deltaBytes > 0 ? "increase" : "decrease"}">${signedSize(item.deltaBytes)}</td>
+      <td>${humanSize(item.beforeSize)} → ${humanSize(item.afterSize)}</td>
+      <td><div class="path">${escapeHTML(item.path)}</div><div class="reason">${escapeHTML(item.category || "其他")}</div></td>
+    </tr>`).join("");
 }
 
 function renderDashboard(status = latestStatus) {
   latestStatus = {...latestStatus, ...(status || {})};
   const current = latestStatus;
+  renderChanges(current.changes);
   const files = Number(current.filesSeen || 0);
   const bytes = Number(current.bytesSeen || 0);
   const duplicateBytes = duplicateGroups.reduce((sum, group) => sum + Number(group.reclaimable || 0), 0);
@@ -336,7 +383,7 @@ function setRunning(running) {
   $("cancel").disabled = !running || !backendAvailable;
   $("pulse").classList.toggle("active", running);
   $("trashSelected").disabled = running || !backendAvailable || selected.size === 0;
-  $("executePlan").disabled = running || !backendAvailable || plan.size === 0;
+  $("executePlan").disabled = running || !backendAvailable || plan.size === 0 || !planPreflight.ready;
   $("checkpointDatabase").disabled = running || !backendAvailable;
   $("optimizeDatabase").disabled = running || !backendAvailable;
 }
@@ -596,7 +643,7 @@ async function startScan() {
         maxDurationSeconds: budgetValue("budgetMinutes", 60)
       })
     });
-    renderDashboard({state: "running", phase: "walking", root: scanRoot, filesSeen: 0, bytesSeen: 0, errors: 0, excluded: 0});
+    renderDashboard({state: "running", phase: "walking", root: scanRoot, filesSeen: 0, bytesSeen: 0, errors: 0, excluded: 0, changes: null});
     setRunning(true);
     $("status").textContent = "正在扫描…";
     $("detail").textContent = "扫描过程中会持续更新大文件，目录排行将在扫描结束后生成。";
@@ -769,6 +816,89 @@ function planRecords() {
   return [...plan].map(recordByPath).filter(Boolean);
 }
 
+function pathIsWithin(path, root) {
+  if (!path || !root) return false;
+  const normalize = (value) => String(value).replaceAll("\\", "/").replace(/\/$/, "").toLocaleLowerCase();
+  const child = normalize(path);
+  const parent = normalize(root);
+  return child === parent || child.startsWith(parent === "" ? "/" : `${parent}/`);
+}
+
+function previewDisk(records) {
+  const paths = records.map((record) => record.path).filter(Boolean);
+  const candidates = roots
+    .filter((root) => root.total && paths.every((path) => pathIsWithin(path, root.path)))
+    .sort((a, b) => b.path.length - a.path.length);
+  return candidates[0] || null;
+}
+
+function cleanupPreview(records = planRecords()) {
+  return CleanupPreview.build(records, previewDisk(records));
+}
+
+function renderPlanPreview(records) {
+  if (!records.length) {
+    $("planPreview").innerHTML = `<div class="plan-preview-empty">把文件加入计划后，这里会在不修改任何文件的前提下模拟清理结果。</div>`;
+    return;
+  }
+  const preview = cleanupPreview(records);
+  const categoryMax = Math.max(1, ...preview.categories.map((item) => item.bytes));
+  const diskAvailable = preview.disk.totalBytes > 0;
+  const blocked = (planPreflight.items || []).filter((item) => !item.ready);
+  const preflight = planPreflight.state === "checking"
+    ? `<div class="preflight checking"><strong>正在执行起飞前检查…</strong><span>只读复核文件状态，不会移动文件。</span></div>`
+    : planPreflight.state === "ready"
+      ? `<div class="preflight ready"><strong>✓ 起飞前检查通过</strong><span>${planPreflight.readyCount.toLocaleString()} 个文件仍与扫描时一致，可进入最终确认。</span></div>`
+      : `<div class="preflight blocked"><strong>⚠ 起飞前检查阻止执行</strong><span>${escapeHTML(blocked[0]?.message || planPreflight.message || "请重新扫描后再试。")}${blocked.length > 1 ? `（另有 ${blocked.length - 1} 项）` : ""}</span></div>`;
+  $("planPreview").innerHTML = `
+    <div class="preview-metrics">
+      <div><span>预计释放</span><strong>${humanSize(preview.reclaimableBytes)}</strong><small>${preview.fileCount.toLocaleString()} 个文件</small></div>
+      <div><span>清理后可用</span><strong>${diskAvailable ? humanSize(preview.disk.freeAfter) : "待确定"}</strong><small>${diskAvailable ? `目前 ${humanSize(preview.disk.freeBefore)}` : "计划跨磁盘或容量未知"}</small></div>
+      <div><span>磁盘占用率</span><strong>${diskAvailable ? `${preview.disk.usedPercentAfter.toFixed(1)}%` : "待确定"}</strong><small>${diskAvailable ? `从 ${preview.disk.usedPercentBefore.toFixed(1)}% 降至` : "不影响释放量计算"}</small></div>
+      <div><span>需人工确认</span><strong>${preview.advice.review.count.toLocaleString()} 个</strong><small>${humanSize(preview.advice.review.bytes)}</small></div>
+    </div>
+    <div class="preview-breakdown">
+      <div>
+        <strong>按类型模拟</strong>
+        <div class="preview-bars">${preview.categories.map((item) => `
+          <div class="preview-bar">
+            <span>${escapeHTML(item.category)} · ${item.count.toLocaleString()} 个</span>
+            <b>${humanSize(item.bytes)}</b>
+            <i><em style="width:${(item.bytes / categoryMax * 100).toFixed(1)}%"></em></i>
+          </div>`).join("")}</div>
+      </div>
+      <p class="preview-note"><strong>只读模拟</strong>此处按文件逻辑大小估算；回收站、文件系统压缩和硬链接可能使实际磁盘变化不同。导出报告不会执行清理。</p>
+    </div>
+    ${preflight}`;
+}
+
+async function refreshPlanPreflight(records = planRecords()) {
+  const requestID = ++preflightRequest;
+  const paths = records.map((record) => record.path);
+  if (!paths.length) {
+    planPreflight = {state: "idle", ready: false, items: []};
+    $("executePlan").disabled = true;
+    return;
+  }
+  planPreflight = {state: "checking", ready: false, items: []};
+  $("executePlan").disabled = true;
+  renderPlanPreview(records);
+  try {
+    const result = await api("/api/plan/preflight", {
+      method: "POST",
+      body: JSON.stringify({paths})
+    });
+    if (requestID !== preflightRequest) return;
+    planPreflight = {...result, state: result.ready ? "ready" : "blocked"};
+  } catch (error) {
+    if (requestID !== preflightRequest) return;
+    planPreflight = {state: "error", ready: false, items: [], message: error.message};
+  }
+  const current = planRecords();
+  renderPlanPreview(current);
+  $("executePlan").disabled = !planPreflight.ready || $("scan").disabled || current.length === 0;
+}
+
 function renderPlan() {
   const records = planRecords();
   const total = records.reduce((sum, item) => sum + item.size, 0);
@@ -776,10 +906,13 @@ function renderPlan() {
     ? `${records.length} 个文件 · 待移入回收站 ${humanSize(total)}`
     : "尚未加入文件";
   $("clearPlan").disabled = records.length === 0;
-  $("executePlan").disabled = records.length === 0 || $("scan").disabled;
+  $("exportPlanPreview").disabled = records.length === 0;
+  $("executePlan").disabled = true;
+  renderPlanPreview(records);
   if (!records.length) {
     $("planRows").innerHTML = `<tr class="empty"><td colspan="4">从大文件或重复文件中加入待清理项目</td></tr>`;
     renderDashboard();
+    refreshPlanPreflight(records);
     return;
   }
   $("planRows").innerHTML = records.sort((a, b) => b.size - a.size).map((item) => `
@@ -790,6 +923,7 @@ function renderPlan() {
       <td><button class="remove-plan ghost">${iconSVG("clear")}移出计划</button></td>
     </tr>`).join("");
   renderDashboard();
+  refreshPlanPreflight(records);
 }
 
 function updateCategories() {
@@ -861,6 +995,12 @@ function updateSelection() {
 }
 
 async function executeCleanupPlan() {
+	await refreshPlanPreflight();
+  if (!planPreflight.ready) {
+    toast("起飞前检查未通过，请重新扫描或移出被阻止的文件");
+    refreshPlanPreflight();
+    return;
+  }
   const paths = [...plan];
   const records = planRecords();
   const total = records.reduce((sum, item) => sum + item.size, 0);
@@ -1206,6 +1346,29 @@ $("exportCsv").addEventListener("click", () => {
   const csv = [fields.join(","), ...exportRows().map((row) => fields.map((field) => quote(row[field])).join(","))].join("\r\n");
   const filename = downloadExport("\ufeff" + csv, "text/csv;charset=utf-8", "csv");
   toast(`已导出 ${filename}，请在下载文件夹查看`);
+});
+
+$("exportPlanPreview").addEventListener("click", () => {
+  const records = planRecords();
+  if (!records.length) return;
+  const preview = cleanupPreview(records);
+  const payload = {
+    type: "space-sheriff-cleanup-preview",
+    schemaVersion: 1,
+    appVersion: $("version").textContent,
+    exportedAt: new Date().toISOString(),
+    notice: "这是只读模拟，导出不会删除或移动文件。预计释放量按逻辑文件大小计算。",
+    preview,
+    preflight: planPreflight.state === "ready" || planPreflight.state === "blocked" ? planPreflight : null,
+    files: records.map((record) => ({
+      path: record.path,
+      size: Number(record.size || 0),
+      modifiedAt: record.modifiedAt,
+      advice: record.advice
+    }))
+  };
+  const filename = downloadExport(JSON.stringify(payload, null, 2), "application/json", "cleanup-preview.json");
+  toast(`已导出 ${filename}，未修改任何文件`);
 });
 
 $("roots").addEventListener("change", () => {

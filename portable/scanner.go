@@ -52,6 +52,26 @@ type ScanErrorSample struct {
 	Message  string `json:"message"`
 }
 
+type ScanChange struct {
+	Path       string `json:"path"`
+	Kind       string `json:"kind"`
+	BeforeSize int64  `json:"beforeSize"`
+	AfterSize  int64  `json:"afterSize"`
+	DeltaBytes int64  `json:"deltaBytes"`
+	Category   string `json:"category,omitempty"`
+}
+
+type ScanChanges struct {
+	BaselineAvailable bool         `json:"baselineAvailable"`
+	BaselineAt        string       `json:"baselineAt,omitempty"`
+	NewCount          int          `json:"newCount"`
+	GrownCount        int          `json:"grownCount"`
+	ShrunkCount       int          `json:"shrunkCount"`
+	RemovedCount      int          `json:"removedCount"`
+	NetBytes          int64        `json:"netBytes"`
+	Items             []ScanChange `json:"items"`
+}
+
 type ScanStatus struct {
 	State              string            `json:"state"`
 	Phase              string            `json:"phase"`
@@ -74,6 +94,7 @@ type ScanStatus struct {
 	BudgetExceeded     string            `json:"budgetExceeded,omitempty"`
 	Results            []FileRecord      `json:"results,omitempty"`
 	DuplicateGroups    []DuplicateGroup  `json:"duplicateGroups,omitempty"`
+	Changes            *ScanChanges      `json:"changes,omitempty"`
 	Message            string            `json:"message,omitempty"`
 }
 
@@ -96,6 +117,11 @@ func (j *scanJob) snapshot() ScanStatus {
 	out := j.status
 	out.Results = append([]FileRecord(nil), j.status.Results...)
 	out.DuplicateGroups = cloneDuplicateGroups(j.status.DuplicateGroups)
+	if j.status.Changes != nil {
+		changes := *j.status.Changes
+		changes.Items = append([]ScanChange(nil), j.status.Changes.Items...)
+		out.Changes = &changes
+	}
 	if len(j.status.ErrorCounts) > 0 {
 		out.ErrorCounts = make(map[string]int64, len(j.status.ErrorCounts))
 		for category, count := range j.status.ErrorCounts {
@@ -479,11 +505,20 @@ func (j *scanJob) run(ctx context.Context, root string, options ScanOptions) {
 			ModifiedAt: modified,
 		}
 	}
+	var changes *ScanChanges
+	if err == nil && j.store != nil {
+		var changeErr error
+		changes, changeErr = j.store.compareScanFindings(root, results, 20)
+		if changeErr != nil {
+			j.noteError("index", "", fmt.Errorf("比较扫描历史失败：%w", changeErr))
+		}
+	}
 
 	j.mu.Lock()
 	j.status.ElapsedMS = time.Since(j.started).Milliseconds()
 	j.status.Results = results
 	j.status.DuplicateGroups = duplicateGroups
+	j.status.Changes = changes
 	j.known = make(map[string]FileRecord, len(results))
 	j.folders = folders
 	j.duplicateByPath = duplicateByPath

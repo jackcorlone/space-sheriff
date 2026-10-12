@@ -168,6 +168,7 @@ func runServer(store *Store, dataDir string) error {
 	mux.HandleFunc("/api/trash", app.trash)
 	mux.HandleFunc("/api/trash-batch", app.trashBatch)
 	mux.HandleFunc("/api/plan", app.plan)
+	mux.HandleFunc("/api/plan/preflight", app.planPreflight)
 	mux.HandleFunc("/api/policies", app.policies)
 	mux.HandleFunc("/api/policies/activate", app.activatePolicy)
 	mux.HandleFunc("/api/policies/import", app.importPolicy)
@@ -477,6 +478,72 @@ type trashResult struct {
 	AuditError string `json:"auditError,omitempty"`
 }
 
+type planPreflightItem struct {
+	Path    string `json:"path"`
+	Size    int64  `json:"size"`
+	Ready   bool   `json:"ready"`
+	Message string `json:"message"`
+}
+
+type planPreflightResult struct {
+	Ready        bool                `json:"ready"`
+	ReadyCount   int                 `json:"readyCount"`
+	BlockedCount int                 `json:"blockedCount"`
+	ReadyBytes   int64               `json:"readyBytes"`
+	Items        []planPreflightItem `json:"items"`
+}
+
+func (s *server) planPreflight(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var request struct {
+		Paths []string `json:"paths"`
+	}
+	if !decodeJSON(w, r, &request) {
+		return
+	}
+	if len(request.Paths) < 1 || len(request.Paths) > 500 {
+		http.Error(w, "预检需要 1 到 500 个文件", http.StatusBadRequest)
+		return
+	}
+	seen := make(map[string]bool, len(request.Paths))
+	for _, path := range request.Paths {
+		if strings.TrimSpace(path) == "" || seen[path] {
+			http.Error(w, "预检计划包含空路径或重复文件", http.StatusBadRequest)
+			return
+		}
+		seen[path] = true
+	}
+
+	s.mu.Lock()
+	job := s.job
+	s.mu.Unlock()
+	duplicateBlocked := make(map[string]bool)
+	if job != nil {
+		duplicateBlocked = job.duplicatePathsBlockedByPlan(request.Paths)
+	}
+	result := planPreflightResult{Items: make([]planPreflightItem, 0, len(request.Paths))}
+	for _, path := range request.Paths {
+		record, err := s.cleanupCandidate(path)
+		if err == nil && duplicateBlocked[path] {
+			err = fmt.Errorf("清理计划必须为每组重复文件至少保留一个副本")
+		}
+		item := planPreflightItem{Path: path, Size: record.Size, Ready: err == nil, Message: "可以安全进入确认步骤"}
+		if err != nil {
+			item.Message = err.Error()
+			result.BlockedCount++
+		} else {
+			result.ReadyCount++
+			result.ReadyBytes += record.Size
+		}
+		result.Items = append(result.Items, item)
+	}
+	result.Ready = result.ReadyCount > 0 && result.BlockedCount == 0
+	writeJSON(w, result)
+}
+
 func (s *server) trashBatch(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -603,6 +670,23 @@ func (s *server) executeCleanup(paths []string) (string, int64, []trashResult, e
 }
 
 func (s *server) trashOne(path string) (FileRecord, error) {
+	record, err := s.cleanupCandidate(path)
+	if err != nil {
+		return FileRecord{}, err
+	}
+	if err := moveToTrash(record.Path); err != nil {
+		return FileRecord{}, fmt.Errorf("移入回收站失败：%w", err)
+	}
+	s.mu.Lock()
+	job := s.job
+	s.mu.Unlock()
+	job.mu.Lock()
+	job.removeRecordLocked(record)
+	job.mu.Unlock()
+	return record, nil
+}
+
+func (s *server) cleanupCandidate(path string) (FileRecord, error) {
 	s.mu.Lock()
 	job := s.job
 	s.mu.Unlock()
@@ -628,12 +712,6 @@ func (s *server) trashOne(path string) (FileRecord, error) {
 	if err := validateTrashCandidate(record); err != nil {
 		return FileRecord{}, err
 	}
-	if err := moveToTrash(record.Path); err != nil {
-		return FileRecord{}, fmt.Errorf("移入回收站失败：%w", err)
-	}
-	job.mu.Lock()
-	job.removeRecordLocked(record)
-	job.mu.Unlock()
 	return record, nil
 }
 
@@ -922,9 +1000,14 @@ func (j *scanJob) removeRecordLocked(record FileRecord) {
 }
 
 func (j *scanJob) wouldRemoveEveryDuplicate(paths []string) bool {
+	return len(j.duplicatePathsBlockedByPlan(paths)) > 0
+}
+
+func (j *scanJob) duplicatePathsBlockedByPlan(paths []string) map[string]bool {
 	j.mu.RLock()
 	defer j.mu.RUnlock()
 	selected := make(map[string]bool, len(paths))
+	blocked := make(map[string]bool)
 	for _, path := range paths {
 		selected[path] = true
 	}
@@ -936,10 +1019,14 @@ func (j *scanJob) wouldRemoveEveryDuplicate(paths []string) bool {
 			}
 		}
 		if remaining == 0 {
-			return true
+			for _, record := range group.Files {
+				if selected[record.Path] {
+					blocked[record.Path] = true
+				}
+			}
 		}
 	}
-	return false
+	return blocked
 }
 
 func (s *server) quit(w http.ResponseWriter, r *http.Request) {

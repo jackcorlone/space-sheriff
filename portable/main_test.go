@@ -237,6 +237,102 @@ func TestTrashBatchKeepsOneDuplicateCopy(t *testing.T) {
 	}
 }
 
+func TestPlanPreflightChecksCurrentFilesWithoutChangingThem(t *testing.T) {
+	root, err := os.MkdirTemp("/private/tmp", "space-sheriff-preflight-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	readyPath := filepath.Join(root, "ready.bin")
+	changedPath := filepath.Join(root, "changed.bin")
+	if err := os.WriteFile(readyPath, []byte("ready"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(changedPath, []byte("before"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	readyInfo, _ := os.Stat(readyPath)
+	changedInfo, _ := os.Stat(changedPath)
+	app := &server{job: &scanJob{
+		status: ScanStatus{State: "done"},
+		known: map[string]FileRecord{
+			readyPath:   {Path: readyPath, Size: readyInfo.Size(), ModifiedUnixNano: readyInfo.ModTime().UnixNano(), Advice: Advice{Level: "safe"}},
+			changedPath: {Path: changedPath, Size: changedInfo.Size(), ModifiedUnixNano: changedInfo.ModTime().UnixNano(), Advice: Advice{Level: "review"}},
+		},
+	}}
+	if err := os.WriteFile(changedPath, []byte("changed after scan"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(map[string]any{"paths": []string{readyPath, changedPath, filepath.Join(root, "unknown.bin")}})
+	result := httptest.NewRecorder()
+	app.planPreflight(result, httptest.NewRequest(http.MethodPost, "/api/plan/preflight", bytes.NewReader(body)))
+	if result.Code != http.StatusOK {
+		t.Fatalf("preflight got %d: %s", result.Code, result.Body.String())
+	}
+	var preview planPreflightResult
+	if err := json.NewDecoder(result.Body).Decode(&preview); err != nil {
+		t.Fatal(err)
+	}
+	if preview.Ready || preview.ReadyCount != 1 || preview.BlockedCount != 2 || preview.ReadyBytes != readyInfo.Size() {
+		t.Fatalf("unexpected preflight: %+v", preview)
+	}
+	if _, err := os.Stat(readyPath); err != nil {
+		t.Fatalf("preflight changed ready file: %v", err)
+	}
+}
+
+func TestPlanPreflightRequiresCompletedCurrentScan(t *testing.T) {
+	for name, app := range map[string]*server{
+		"missing": {},
+		"running": {job: &scanJob{status: ScanStatus{State: "running"}, known: map[string]FileRecord{"file": {Path: "file"}}}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			result := httptest.NewRecorder()
+			app.planPreflight(result, httptest.NewRequest(http.MethodPost, "/api/plan/preflight", strings.NewReader(`{"paths":["file"]}`)))
+			var preview planPreflightResult
+			if err := json.NewDecoder(result.Body).Decode(&preview); err != nil {
+				t.Fatal(err)
+			}
+			if preview.Ready || preview.BlockedCount != 1 {
+				t.Fatalf("unexpected preflight: %+v", preview)
+			}
+		})
+	}
+}
+
+func TestPlanPreflightBlocksOnlyDuplicateGroupThatWouldBeFullyRemoved(t *testing.T) {
+	root, err := os.MkdirTemp("/private/tmp", "space-sheriff-duplicates-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	paths := []string{filepath.Join(root, "copy-a"), filepath.Join(root, "copy-b"), filepath.Join(root, "other")}
+	known := make(map[string]FileRecord)
+	for _, path := range paths {
+		if err := os.WriteFile(path, []byte("same"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		info, _ := os.Stat(path)
+		known[path] = FileRecord{Path: path, Size: info.Size(), ModifiedUnixNano: info.ModTime().UnixNano(), Advice: Advice{Level: "safe"}}
+	}
+	app := &server{job: &scanJob{
+		status: ScanStatus{State: "done", DuplicateGroups: []DuplicateGroup{{
+			ID: "duplicate", Files: []FileRecord{known[paths[0]], known[paths[1]]},
+		}}},
+		known: known,
+	}}
+	body, _ := json.Marshal(map[string]any{"paths": paths})
+	result := httptest.NewRecorder()
+	app.planPreflight(result, httptest.NewRequest(http.MethodPost, "/api/plan/preflight", bytes.NewReader(body)))
+	var preview planPreflightResult
+	if err := json.NewDecoder(result.Body).Decode(&preview); err != nil {
+		t.Fatal(err)
+	}
+	if preview.Ready || preview.ReadyCount != 1 || preview.BlockedCount != 2 || !preview.Items[2].Ready {
+		t.Fatalf("unexpected duplicate preflight: %+v", preview)
+	}
+}
+
 func TestPlanHandlerPersistsKnownRecords(t *testing.T) {
 	store, _ := testStore(t)
 	path := filepath.Join("workspace", "candidate.bin")

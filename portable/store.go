@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -412,6 +413,95 @@ func (s *Store) finishScan(id, state, message string, status ScanStatus) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+func (s *Store) compareScanFindings(root string, current []FileRecord, limit int) (*ScanChanges, error) {
+	result := &ScanChanges{Items: []ScanChange{}}
+	var baselineID string
+	var completedAt int64
+	err := s.db.QueryRow(
+		`SELECT id, completed_at FROM scan_sessions
+		 WHERE root = ? AND state = 'completed' AND completed_at IS NOT NULL
+		 ORDER BY completed_at DESC LIMIT 1`, root,
+	).Scan(&baselineID, &completedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return result, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	result.BaselineAvailable = true
+	result.BaselineAt = time.Unix(0, completedAt).Format("2006-01-02 15:04")
+
+	baseline := make(map[string]ScanChange)
+	rows, err := s.db.Query(
+		`SELECT path, size, advice_category FROM scan_findings WHERE session_id = ?`, baselineID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var item ScanChange
+		if err := rows.Scan(&item.Path, &item.BeforeSize, &item.Category); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		baseline[item.Path] = item
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+
+	changes := make([]ScanChange, 0)
+	for _, record := range current {
+		before, existed := baseline[record.Path]
+		delete(baseline, record.Path)
+		item := ScanChange{Path: record.Path, AfterSize: record.Size, Category: record.Advice.Category}
+		if !existed {
+			item.Kind = "new"
+			item.DeltaBytes = record.Size
+			result.NewCount++
+		} else if record.Size > before.BeforeSize {
+			item.Kind = "grown"
+			item.BeforeSize = before.BeforeSize
+			item.DeltaBytes = record.Size - before.BeforeSize
+			result.GrownCount++
+		} else if record.Size < before.BeforeSize {
+			item.Kind = "shrunk"
+			item.BeforeSize = before.BeforeSize
+			item.DeltaBytes = record.Size - before.BeforeSize
+			result.ShrunkCount++
+		} else {
+			continue
+		}
+		changes = append(changes, item)
+		result.NetBytes += item.DeltaBytes
+	}
+	for _, before := range baseline {
+		before.Kind = "removed"
+		before.DeltaBytes = -before.BeforeSize
+		result.RemovedCount++
+		result.NetBytes += before.DeltaBytes
+		changes = append(changes, before)
+	}
+	sort.Slice(changes, func(i, k int) bool {
+		left, right := changes[i].DeltaBytes, changes[k].DeltaBytes
+		if left < 0 {
+			left = -left
+		}
+		if right < 0 {
+			right = -right
+		}
+		if left == right {
+			return changes[i].Path < changes[k].Path
+		}
+		return left > right
+	})
+	if limit > 0 && len(changes) > limit {
+		changes = changes[:limit]
+	}
+	result.Items = changes
+	return result, nil
 }
 
 func (s *Store) cachedHash(record FileRecord) (string, bool, error) {

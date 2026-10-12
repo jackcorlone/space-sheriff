@@ -71,7 +71,7 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: "24"
-      - run: node --check portable/web/app.js
+      - run: node --check portable/web/app.js && node --test portable/web/cleanup-preview.test.cjs
 
   python:
     name: Python · ${{ matrix.os }}

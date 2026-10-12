@@ -323,6 +323,24 @@ __pycache__</textarea>
       </section>
     </section>
 
+    <section id="changeSection" class="card changes hidden">
+      <div class="results-head">
+        <div>
+          <h2><span class="section-icon" data-icon="activity"></span>空间变化雷达</h2>
+          <span id="changeSummary" class="muted">完成扫描后与上次同路径结果比较</span>
+        </div>
+        <span id="changeNet" class="change-net">—</span>
+      </div>
+      <div id="changeMetrics" class="change-metrics"></div>
+      <p id="changeNote" class="hint change-note">只比较达到大文件阈值的结果；“离开结果”不等于文件已删除。</p>
+      <div id="changeTable" class="table-wrap change-table hidden">
+        <table>
+          <thead><tr><th>变化</th><th>差值</th><th>上次 → 本次</th><th>文件</th></tr></thead>
+          <tbody id="changeRows"></tbody>
+        </table>
+      </div>
+    </section>
+
     <section id="folderSection" class="card folders hidden">
       <div class="results-head">
         <div>
@@ -356,9 +374,13 @@ __pycache__</textarea>
           <span id="planSummary" class="muted">尚未加入文件</span>
         </div>
         <div class="head-actions">
+          <button id="exportPlanPreview" class="ghost" disabled><span class="button-icon" data-icon="download"></span>导出模拟报告</button>
           <button id="clearPlan" class="ghost" disabled><span class="button-icon" data-icon="clear"></span>清空计划</button>
           <button id="executePlan" class="primary" disabled><span class="button-icon" data-icon="trash"></span>确认并移入回收站</button>
         </div>
+      </div>
+      <div id="planPreview" class="plan-preview" aria-live="polite">
+        <div class="plan-preview-empty">把文件加入计划后，这里会在不修改任何文件的前提下模拟清理结果。</div>
       </div>
       <div class="table-wrap plan-table">
         <table>
@@ -424,6 +446,7 @@ __pycache__</textarea>
   </main>
 
   <div id="toast"></div>
+  <script src="cleanup-preview.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

@@ -341,3 +341,38 @@ func TestStoreCleanupJournalAndRecovery(t *testing.T) {
 		t.Fatalf("unexpected completed transaction: %+v", completed)
 	}
 }
+
+func TestStoreComparesCurrentFindingsWithPreviousCompletedScan(t *testing.T) {
+	store, _ := testStore(t)
+	root := "/comparison-root"
+	baselineID, err := store.beginScan(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline := []FileRecord{
+		{Path: "/grown", Size: 10, Advice: Advice{Category: "缓存"}},
+		{Path: "/shrunk", Size: 20, Advice: Advice{Category: "文档"}},
+		{Path: "/removed", Size: 30, Advice: Advice{Category: "其他"}},
+		{Path: "/same", Size: 40, Advice: Advice{Category: "其他"}},
+	}
+	if err := store.finishScan(baselineID, "completed", "", ScanStatus{Results: baseline}); err != nil {
+		t.Fatal(err)
+	}
+	current := []FileRecord{
+		{Path: "/grown", Size: 25, Advice: Advice{Category: "缓存"}},
+		{Path: "/shrunk", Size: 5, Advice: Advice{Category: "文档"}},
+		{Path: "/new", Size: 50, Advice: Advice{Category: "安装包"}},
+		{Path: "/same", Size: 40, Advice: Advice{Category: "其他"}},
+	}
+	changes, err := store.compareScanFindings(root, current, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changes.BaselineAvailable || changes.NewCount != 1 || changes.GrownCount != 1 ||
+		changes.ShrunkCount != 1 || changes.RemovedCount != 1 || changes.NetBytes != 20 {
+		t.Fatalf("unexpected changes: %+v", changes)
+	}
+	if len(changes.Items) != 4 || changes.Items[0].Path != "/new" {
+		t.Fatalf("unexpected ranked changes: %+v", changes.Items)
+	}
+}
